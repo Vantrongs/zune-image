@@ -18,4 +18,4 @@ description = "Photoshop Simple PSD decoder"
 log = ["zune-core/log"]
 
 [dependencies]
-zune-core = { path = "../zune-core", version = "^0.5.1" }
+zune-core = { version = "0.5.3" }

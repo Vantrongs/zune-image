@@ -97,14 +97,12 @@ impl OperationsTrait for Resize {
             .metadata()
             .color_trc()
             .unwrap_or(ColorCharacteristics::sRGB);
+        let transfer_function = TransferFunction::try_from(transfer_function)?;
 
         if !is_image_linear {
             let start = Instant::now();
             trace!("Converting image to linear along resize method");
-            let transfers = ImageTransfer::new(
-                TransferFunction::from(transfer_function),
-                ConversionType::GammaToLinear
-            );
+            let transfers = ImageTransfer::new(transfer_function, ConversionType::GammaToLinear);
             transfers.execute_impl(image)?;
             let duration = start.elapsed();
             trace!(
@@ -201,10 +199,7 @@ impl OperationsTrait for Resize {
         if !is_image_linear {
             let start = Instant::now();
             trace!("Converting image back to gamma along resize method");
-            let transfers = ImageTransfer::new(
-                TransferFunction::from(transfer_function),
-                ConversionType::LinearToGamma
-            );
+            let transfers = ImageTransfer::new(transfer_function, ConversionType::LinearToGamma);
             transfers.execute_impl(image)?;
             let duration = start.elapsed();
             trace!(

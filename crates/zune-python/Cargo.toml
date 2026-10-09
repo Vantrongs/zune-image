@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = "0.21.2"
 zune-image = { path = "../zune-image", default-features = false, features = ["image_formats", "metadata", "threads", "simd", "log"] }
-zune-core = { path = "../zune-core", features = ["log"] }
+zune-core = { version = "0.5.3", features = ["log"] }
 zune-imageprocs = { path = "../zune-imageprocs", features = ["threads", "exif"] }
 numpy = "0.21.0"
 pyo3-log = "0.11.0"

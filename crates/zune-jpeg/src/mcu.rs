@@ -410,7 +410,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         // We statically specialize on this to improve code generation of the common case a little
         // bit. We could also special case common sub-sampling cases but be mindful of code bloat.
         if is_one_by_one {
-            self.inner_decode_mcu_width::<PROGRESSIVE, false>(
+            self.inner_decode_mcu_width::<PROGRESSIVE, false, false>(
                 mcu_width,
                 mcu_height,
                 tmp,
@@ -418,7 +418,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 progressive
             )
         } else {
-            self.inner_decode_mcu_width::<PROGRESSIVE, true>(
+            self.inner_decode_mcu_width::<PROGRESSIVE, true, false>(
                 mcu_width,
                 mcu_height,
                 tmp,
@@ -433,7 +433,9 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     // constant folding. And constant folding is quite important for performance here as
     // when `not SAMPLED` then the inner loop has exactly one iteration per component in
     // the scan. The difference was ~1% or a bit more.
-    fn inner_decode_mcu_width<const PROGRESSIVE: bool, const SAMPLED: bool>(
+    pub(crate) fn inner_decode_mcu_width<
+        const PROGRESSIVE: bool, const SAMPLED: bool, const SINGLE_SCAN: bool
+    >(
         &mut self, mcu_width: usize, mcu_height: usize, tmp: &mut [i32; 64],
         stream: &mut BitStream, progressive: &mut [Vec<i16>; 4]
     ) -> Result<McuContinuation, DecodeErrors> {
@@ -607,12 +609,20 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             }
         }
 
-        self.check_stream_marker_after_mcu_width(stream)
+        self.check_stream_marker_after_mcu_width::<SINGLE_SCAN>(stream)
     }
 
-    fn check_stream_marker_after_mcu_width(
+    fn check_stream_marker_after_mcu_width<const SINGLE_SCAN: bool>(
         &mut self, stream: &mut BitStream
     ) -> Result<McuContinuation, DecodeErrors> {
+        // A resumable single-scan reader must never mutate scan or table configuration.
+        if SINGLE_SCAN
+            && stream.marker.is_some_and(|m| !matches!(m, Marker::EOI | Marker::RST(_)))
+        {
+            return Err(DecodeErrors::FormatStatic(
+                "Row decoding cannot continue across scans or table changes"
+            ));
+        }
         // After all interleaved components, that's an MCU
         // handle stream markers
         //
@@ -947,7 +957,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     }
 }
 
-enum McuContinuation {
+pub(crate) enum McuContinuation {
     Ok,
     AnotherSos,
     /// Found an inter-scan marker (DHT/DQT/DRI/COM/APP) that needs handling.

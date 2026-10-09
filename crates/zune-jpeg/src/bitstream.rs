@@ -108,6 +108,7 @@ macro_rules! decode_huff {
 
 /// A `BitStream` struct, a bit by bit reader with super powers
 ///
+#[derive(Clone)]
 #[rustfmt::skip]
 pub(crate) struct BitStream {
     /// A MSB type buffer that is used for some certain operations

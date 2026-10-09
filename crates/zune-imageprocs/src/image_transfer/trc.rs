@@ -7,6 +7,7 @@
 #![allow(clippy::excessive_precision)]
 
 use zune_core::colorspace::ColorCharacteristics;
+use zune_image::errors::ImageErrors;
 
 #[inline]
 /// Linear transfer function for sRGB
@@ -303,10 +304,12 @@ impl From<u8> for TransferFunction {
         }
     }
 }
-impl From<ColorCharacteristics> for TransferFunction {
+impl TryFrom<ColorCharacteristics> for TransferFunction {
+    type Error = ImageErrors;
+
     #[inline]
-    fn from(value: ColorCharacteristics) -> Self {
-        match value {
+    fn try_from(value: ColorCharacteristics) -> Result<Self, Self::Error> {
+        Ok(match value {
             ColorCharacteristics::sRGB => Self::Srgb,
             ColorCharacteristics::Rec709 => Self::Rec709,
             ColorCharacteristics::Gamma2p2 => Self::Gamma2p2,
@@ -317,8 +320,15 @@ impl From<ColorCharacteristics> for TransferFunction {
             ColorCharacteristics::Bt1361 => Self::Bt1361,
             ColorCharacteristics::Smpte240 => Self::Smpte240,
             ColorCharacteristics::Iec61966 => Self::Iec61966,
-            ColorCharacteristics::Linear => Self::Linear
-        }
+            ColorCharacteristics::Linear => Self::Linear,
+            ColorCharacteristics::PQ
+            | ColorCharacteristics::HLG
+            | ColorCharacteristics::Unknown(_) => {
+                return Err(ImageErrors::GenericStr(
+                    "Unsupported color transfer characteristics"
+                ));
+            }
+        })
     }
 }
 impl TransferFunction {

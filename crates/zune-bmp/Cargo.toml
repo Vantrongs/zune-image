@@ -20,5 +20,5 @@ std = ["zune-core/std"]
 rgb_inverse = []
 
 [dependencies]
-zune-core = { version = "^0.5.1", path = "../zune-core" }
+zune-core = { version = "0.5.3" }
 log = "0.4"
