@@ -107,6 +107,8 @@ pub fn choose_idct_1x1_func(_: &DecoderOptions) -> IDCTPtr {
 #[allow(unreachable_code)]
 #[allow(dead_code)]
 mod tests {
+    use alloc::{vec, vec::Vec};
+
     use super::*;
 
     #[test]

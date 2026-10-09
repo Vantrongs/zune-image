@@ -408,11 +408,8 @@ impl<S: AsRef<[u8]>> GrayscaleCheckpoint<S> {
 // whose strict/non-strict behavior must stay unchanged.
 fn validate_single_scan(bytes: &[u8]) -> Result<(), RowDecodeError> {
     let mut position = 0;
-    while position < bytes.len() {
-        if bytes[position] != 0xff {
-            position += 1;
-            continue;
-        }
+    while let Some(offset) = memchr::memchr(0xff, &bytes[position..]) {
+        position += offset;
         while position < bytes.len() && bytes[position] == 0xff {
             position += 1;
         }
@@ -427,6 +424,71 @@ fn validate_single_scan(bytes: &[u8]) -> Result<(), RowDecodeError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::{validate_single_scan, RowDecodeError};
+    use alloc::vec;
+
+    #[test]
+    fn every_marker_code_at_search_offsets_and_after_fill_bytes() {
+        for offset in 0..=129 {
+            for fill in [1, 2, 17] {
+                for marker in 0..=u8::MAX {
+                    let mut bytes = vec![0x42; offset];
+                    bytes.resize(offset + fill, 0xff);
+                    bytes.extend_from_slice(&[marker, 0, 0x42, 0xff, 0xd9]);
+                    let admitted = matches!(marker, 0 | 0xd0..=0xd7 | 0xd9 | 0xff);
+                    let result = validate_single_scan(&bytes);
+                    assert_eq!(
+                        result.is_ok(),
+                        admitted,
+                        "offset={offset} fill={fill} marker={marker:02x}"
+                    );
+                    if !admitted {
+                        assert!(matches!(result, Err(RowDecodeError::Unsupported)));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_truncation_remains_for_the_entropy_decoder() {
+        let mut bytes = vec![0x42; 129];
+        bytes.extend_from_slice(&[0xff, 0, 0x42]);
+        for restart in 0xd0..=0xd7 {
+            bytes.extend_from_slice(&[0xff, 0xff, restart, 0x42]);
+        }
+        bytes.extend_from_slice(&[0xff, 0xff, 0xff, 0xd9]);
+        for end in 0..=bytes.len() {
+            assert!(validate_single_scan(&bytes[..end]).is_ok(), "end={end}");
+        }
+    }
+
+    #[test]
+    fn late_scans_and_tables_are_rejected_only_when_the_marker_is_complete() {
+        let mut prefix = vec![0x42; 8193];
+        prefix.extend_from_slice(&[0xff, 0, 0x42, 0xff, 0xd0, 0x42, 0xff, 0xff]);
+        assert!(validate_single_scan(&prefix).is_ok());
+        for marker in [0xc4, 0xdb, 0xda] {
+            let mut bytes = prefix.clone();
+            bytes.extend_from_slice(&[marker, 0, 2, 0xff, 0xd9]);
+            assert!(matches!(
+                validate_single_scan(&bytes),
+                Err(RowDecodeError::Unsupported)
+            ));
+        }
+    }
+
+    #[test]
+    fn first_eoi_excludes_every_marker_in_a_concatenated_image() {
+        for marker in 0..=u8::MAX {
+            let bytes = [0x42, 0xff, 0xff, 0xd9, 0xff, 0xd8, 0xff, marker];
+            assert!(validate_single_scan(&bytes).is_ok(), "marker={marker:02x}");
+        }
+    }
 }
 
 #[cfg(all(test, feature = "std"))]

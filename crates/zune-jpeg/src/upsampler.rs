@@ -177,6 +177,8 @@ pub fn generic_sampler() -> UpSampler {
 
 #[cfg(test)]
 mod tests {
+    use alloc::{vec, vec::Vec};
+
     use super::*;
 
     #[cfg(feature = "portable_simd")]
