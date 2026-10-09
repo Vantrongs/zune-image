@@ -53,7 +53,13 @@ fn measured(height: u16) -> (usize, usize) {
     .unwrap();
     let mut band = vec![0; rows.output_buffer_size()];
     rows.read_mcu_row(&mut band).unwrap();
+    let before_checkpoint = LIVE.get();
     let checkpoint = rows.checkpoint().unwrap();
+    let checkpoint_allocation = LIVE.get() - before_checkpoint;
+    assert_eq!(checkpoint_allocation, 264 * 8 * 2);
+    let clone = checkpoint.clone();
+    assert_eq!(LIVE.get() - before_checkpoint, 2 * checkpoint_allocation);
+    drop(clone);
     let result = (PEAK.get(), checkpoint.storage_bytes());
     drop(checkpoint);
     drop(band);
@@ -69,8 +75,9 @@ fn height_does_not_grow_row_or_checkpoint_allocation() {
     let tall = measured(65000);
     assert_eq!(short, tall);
     // One i16 band + one u8 output band + one i16 checkpoint band,
-    // plus a bounded allowance for header component/config allocations.
-    assert!(short.0 <= 40 * 264 + 2048, "peak={}", short.0);
+    // plus one cloned checkpoint, bounded headers, and std input staging.
+    let staging = if cfg!(feature = "std") { 8192 } else { 0 };
+    assert!(short.0 <= 56 * 264 + 2048 + staging, "peak={}", short.0);
     assert!(short.1 <= 16 * 264 + 256, "checkpoint={}", short.1);
     println!(
         "width=257 heights=17,65000 peak={} checkpoint={}",

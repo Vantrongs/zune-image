@@ -10,6 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
+#[cfg(not(feature = "std"))]
 use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
@@ -69,6 +70,59 @@ impl<S: AsRef<[u8]>> AsRef<[u8]> for SharedSource<S> {
     }
 }
 
+#[cfg(not(feature = "std"))]
+type RowInput<S> = ZCursor<SharedSource<S>>;
+
+#[cfg(feature = "std")]
+struct RowInput<S>(std::io::BufReader<std::io::Cursor<SharedSource<S>>>);
+
+#[cfg(feature = "std")]
+impl<S: AsRef<[u8]>> RowInput<S> {
+    fn new(source: SharedSource<S>) -> Self {
+        Self(std::io::BufReader::with_capacity(
+            8192,
+            std::io::Cursor::new(source),
+        ))
+    }
+}
+
+#[cfg(feature = "std")]
+impl<S: AsRef<[u8]>> std::io::Read for RowInput<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+#[cfg(feature = "std")]
+impl<S: AsRef<[u8]>> std::io::BufRead for RowInput<S> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.0.fill_buf()
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.0.consume(amount);
+    }
+}
+
+#[cfg(feature = "std")]
+impl<S: AsRef<[u8]>> std::io::Seek for RowInput<S> {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        match position {
+            // Entropy marker lookahead rewinds frequently; ordinary BufReader
+            // seeks discard the staging buffer, repeating source-lease access.
+            std::io::SeekFrom::Current(offset) => {
+                self.0.seek_relative(offset)?;
+                self.0.stream_position()
+            }
+            _ => self.0.seek(position),
+        }
+    }
+
+    fn stream_position(&mut self) -> std::io::Result<u64> {
+        self.0.stream_position()
+    }
+}
+
 /// A reader of tightly packed 8-bit Luma bands, at most eight rows per call.
 ///
 /// The source must return the same bytes for its entire lifetime. Ownership is
@@ -80,7 +134,7 @@ impl<S: AsRef<[u8]>> AsRef<[u8]> for SharedSource<S> {
 /// Output is always Luma, regardless of the output colorspace in `options`.
 pub struct GrayscaleRows<S> {
     source: Arc<Source<S>>,
-    decoder: JpegDecoder<ZCursor<SharedSource<S>>>,
+    decoder: JpegDecoder<RowInput<S>>,
     bits: BitStream,
     next_row: usize,
     fill_rest: bool,
@@ -135,7 +189,7 @@ impl<S: AsRef<[u8]>> GrayscaleRows<S> {
 
     fn from_source(source: Arc<Source<S>>, preflight: bool) -> Result<Self, RowDecodeError> {
         let mut decoder = JpegDecoder::new_with_options(
-            ZCursor::new(SharedSource(Arc::clone(&source))),
+            RowInput::new(SharedSource(Arc::clone(&source))),
             source.options,
         );
         decoder.decode_headers()?;
@@ -373,4 +427,93 @@ fn validate_single_scan(bytes: &[u8]) -> Result<(), RowDecodeError> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "std"))]
+mod input_tests {
+    use super::{RowInput, SharedSource, Source};
+    use alloc::{sync::Arc, vec, vec::Vec};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use zune_core::bytestream::{ZByteReaderTrait, ZSeekFrom};
+    use zune_core::options::DecoderOptions;
+
+    struct Counted {
+        bytes: Vec<u8>,
+        accesses: Arc<AtomicUsize>,
+    }
+
+    impl AsRef<[u8]> for Counted {
+        fn as_ref(&self) -> &[u8] {
+            self.accesses.fetch_add(1, Ordering::Relaxed);
+            &self.bytes
+        }
+    }
+
+    fn input(bytes: Vec<u8>, accesses: Arc<AtomicUsize>) -> RowInput<Counted> {
+        RowInput::new(SharedSource(Arc::new(Source {
+            bytes: Counted { bytes, accesses },
+            options: DecoderOptions::default(),
+        })))
+    }
+
+    #[test]
+    fn lookahead_rewinds_retain_staging_across_buffer_boundaries() {
+        let bytes: Vec<u8> = (0..32771).map(|n| n as u8).collect();
+        let accesses = Arc::new(AtomicUsize::new(0));
+        let mut reader = input(bytes.clone(), accesses.clone());
+        for (position, expected) in bytes.chunks(3).enumerate() {
+            let mut peeked = [0; 3];
+            reader
+                .peek_exact_bytes(&mut peeked[..expected.len()])
+                .unwrap();
+            assert_eq!(reader.z_position().unwrap(), (position * 3) as u64);
+            assert_eq!(&peeked[..expected.len()], expected);
+            let mut actual = [0; 3];
+            reader
+                .read_exact_bytes(&mut actual[..expected.len()])
+                .unwrap();
+            assert_eq!(&actual[..expected.len()], expected);
+        }
+        assert!(reader.is_eof().unwrap());
+        // At most a boundary refill plus one re-read when a peek straddles it.
+        assert!(accesses.load(Ordering::Relaxed) <= 4 * bytes.len().div_ceil(8192) + 4);
+    }
+
+    #[test]
+    fn byte_reader_contract_preserves_logical_positions() {
+        let bytes: Vec<u8> = (0..16403).map(|n| n as u8).collect();
+        let mut reader = input(bytes.clone(), Arc::new(AtomicUsize::new(0)));
+        assert_eq!(reader.read_byte_no_error(), bytes[0]);
+        assert_eq!(reader.z_position().unwrap(), 1);
+        assert_eq!(reader.z_seek(ZSeekFrom::Start(8190)).unwrap(), 8190);
+        let mut peeked = [0; 9];
+        reader.peek_exact_bytes(&mut peeked).unwrap();
+        assert_eq!(peeked, bytes[8190..8199]);
+        assert_eq!(reader.z_position().unwrap(), 8190);
+        assert_eq!(reader.z_seek(ZSeekFrom::Current(9)).unwrap(), 8199);
+        assert_eq!(reader.z_seek(ZSeekFrom::Current(-10)).unwrap(), 8189);
+        assert_eq!(reader.read_byte_no_error(), bytes[8189]);
+        assert_eq!(reader.z_seek(ZSeekFrom::End(-3)).unwrap(), 16400);
+        let mut too_long = [0; 9];
+        assert!(reader.read_exact_bytes(&mut too_long).is_err());
+        assert_eq!(reader.z_position().unwrap(), 16400);
+        assert!(reader.peek_exact_bytes(&mut too_long).is_err());
+        assert_eq!(reader.z_position().unwrap(), 16400);
+        assert_eq!(reader.peek_bytes(&mut too_long).unwrap(), 3);
+        assert_eq!(reader.z_position().unwrap(), 16400);
+        assert_eq!(&too_long[..3], &bytes[16400..]);
+        let mut remaining = vec![55];
+        assert_eq!(reader.read_remaining(&mut remaining).unwrap(), 3);
+        assert_eq!(&remaining[1..], &bytes[16400..]);
+        assert!(reader.is_eof().unwrap());
+        assert_eq!(reader.read_byte_no_error(), 0);
+        assert_eq!(reader.read_bytes(&mut too_long).unwrap(), 0);
+        assert_eq!(reader.z_position().unwrap(), bytes.len() as u64);
+        assert!(reader.z_seek(ZSeekFrom::Current(-16404)).is_err());
+        reader.z_seek(ZSeekFrom::Start(20000)).unwrap();
+        assert!(reader.is_eof().unwrap());
+        assert_eq!(reader.z_position().unwrap(), 20000);
+        reader.z_seek(ZSeekFrom::Start(4)).unwrap();
+        assert_eq!(reader.read_byte_no_error(), bytes[4]);
+    }
 }

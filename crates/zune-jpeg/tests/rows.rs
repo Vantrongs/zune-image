@@ -114,6 +114,40 @@ fn checkpoints_restore_prefetch_dc_restart_and_prior_band() {
 }
 
 #[test]
+fn checkpoints_and_restarts_cross_encoded_staging_boundaries() {
+    let original = fixture("257x17-r7.jpg");
+    let expected = full(&original, options(false)).unwrap();
+    for padding in [7800u16, 16000] {
+        let mut bytes = original[..2].to_vec();
+        bytes.extend_from_slice(&[255, 254]);
+        bytes.extend_from_slice(&(padding + 2).to_be_bytes());
+        bytes.resize(bytes.len() + usize::from(padding), 0);
+        bytes.extend_from_slice(&original[2..]);
+        assert_eq!(full(&bytes, options(false)).unwrap(), expected);
+        let mut rows = GrayscaleRows::new(bytes, options(false)).unwrap();
+        let mut checkpoints = Vec::new();
+        while rows.output_buffer_size() != 0 {
+            checkpoints.push(rows.checkpoint().unwrap());
+            let start = rows.next_row() * 257;
+            let mut band = vec![0; rows.output_buffer_size()];
+            rows.read_mcu_row(&mut band).unwrap();
+            assert_eq!(band, expected[start..start + band.len()]);
+        }
+        for checkpoint in checkpoints.iter().rev() {
+            rows.restore(checkpoint).unwrap();
+            assert_eq!(
+                drain(&mut rows).unwrap(),
+                expected[checkpoint.next_row() * 257..]
+            );
+            assert_eq!(
+                drain(&mut checkpoint.resume().unwrap()).unwrap(),
+                expected[checkpoint.next_row() * 257..]
+            );
+        }
+    }
+}
+
+#[test]
 fn truncation_matches_full_decoder_and_resumes() {
     let bytes = fixture("33x41-r3.jpg");
     let sos = bytes.windows(2).position(|p| p == [255, 218]).unwrap();
@@ -258,4 +292,37 @@ fn independent_checkpoint_readers_run_on_different_threads() {
     let second = std::thread::spawn(move || drain(&mut other.resume().unwrap()).unwrap());
     assert_eq!(first.join().unwrap(), expected[8 * 33..]);
     assert_eq!(second.join().unwrap(), expected[8 * 33..]);
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn encoded_source_access_is_bounded_per_staging_buffer() {
+    struct Counted {
+        bytes: Vec<u8>,
+        accesses: Arc<AtomicUsize>,
+    }
+    impl AsRef<[u8]> for Counted {
+        fn as_ref(&self) -> &[u8] {
+            self.accesses.fetch_add(1, Ordering::Relaxed);
+            &self.bytes
+        }
+    }
+    let bytes = fixture("257x17-r7.jpg");
+    let expected = full(&bytes, options(false)).unwrap();
+    let ceiling = 2 * bytes.len().div_ceil(8192) + 4;
+    let accesses = Arc::new(AtomicUsize::new(0));
+    let mut rows = GrayscaleRows::new(
+        Counted {
+            bytes,
+            accesses: accesses.clone(),
+        },
+        options(false),
+    )
+    .unwrap();
+    let checkpoint = rows.checkpoint().unwrap();
+    assert_eq!(drain(&mut rows).unwrap(), expected);
+    assert!(accesses.load(Ordering::Relaxed) <= ceiling);
+    accesses.store(0, Ordering::Relaxed);
+    assert_eq!(drain(&mut checkpoint.resume().unwrap()).unwrap(), expected);
+    assert!(accesses.load(Ordering::Relaxed) <= ceiling);
 }
