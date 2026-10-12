@@ -61,57 +61,65 @@ impl<'p, R> ProgressReader<'p, R> {
         }
     }
 
-    /// Counts a read of `bytes`, at least one for a read that found no more.
+    /// Counts a read of up to `bytes`, at least one; false once the progress stopped,
+    /// for the read to find nothing.
     #[inline(always)]
-    fn read(&mut self, bytes: usize) {
+    fn read(&mut self, bytes: usize) -> bool {
         self.unreported += bytes.max(1);
-        if self.unreported >= READ_PIECE {
+        self.unreported < READ_PIECE || self.report()
+    }
+
+    /// Reports the reads counted; once stopped, every later read comes here.
+    #[cold]
+    fn report(&mut self) -> bool {
+        if !self.stopped {
             self.stopped = self.progress.advance(core::mem::take(&mut self.unreported));
         }
+        if self.stopped {
+            self.unreported = READ_PIECE;
+        }
+        !self.stopped
     }
 }
 
 impl<R: ZByteReaderTrait> ZByteReaderTrait for ProgressReader<'_, R> {
     #[inline(always)]
     fn read_byte_no_error(&mut self) -> u8 {
-        if self.stopped {
+        if !self.read(1) {
             return 0;
         }
-        self.read(1);
         self.inner.read_byte_no_error()
     }
 
+    #[inline(always)]
     fn read_exact_bytes(&mut self, buf: &mut [u8]) -> Result<(), ZByteIoError> {
-        if self.stopped {
+        if !self.read(buf.len()) {
             return Err(ZByteIoError::NotEnoughBytes(0, buf.len()));
         }
-        self.read(buf.len());
         self.inner.read_exact_bytes(buf)
     }
 
+    #[inline(always)]
     fn read_bytes(&mut self, buf: &mut [u8]) -> Result<usize, ZByteIoError> {
-        if self.stopped {
+        if !self.read(buf.len()) {
             return Ok(0);
         }
-        let read = self.inner.read_bytes(buf)?;
-        self.read(read);
-        Ok(read)
+        self.inner.read_bytes(buf)
     }
 
+    #[inline(always)]
     fn peek_bytes(&mut self, buf: &mut [u8]) -> Result<usize, ZByteIoError> {
-        if self.stopped {
+        if !self.read(buf.len()) {
             return Ok(0);
         }
-        let read = self.inner.peek_bytes(buf)?;
-        self.read(read);
-        Ok(read)
+        self.inner.peek_bytes(buf)
     }
 
+    #[inline(always)]
     fn peek_exact_bytes(&mut self, buf: &mut [u8]) -> Result<(), ZByteIoError> {
-        if self.stopped {
+        if !self.read(buf.len()) {
             return Err(ZByteIoError::NotEnoughBytes(0, buf.len()));
         }
-        self.read(buf.len());
         self.inner.peek_exact_bytes(buf)
     }
 
@@ -165,7 +173,7 @@ mod tests {
     }
 
     /// Reads are reported a piece at a time, and once the progress stops the input
-    /// reads as ended.
+    /// reads as ended: the read that the progress stopped at finds nothing.
     #[test]
     fn reads_end_once_the_progress_stops() {
         let bytes = alloc::vec![0xff_u8; 4 * READ_PIECE];
@@ -178,7 +186,7 @@ mod tests {
         while reader.read_byte_no_error() == 0xff {
             read += 1;
         }
-        assert_eq!(read, 2 * READ_PIECE);
+        assert_eq!(read, 2 * READ_PIECE - 1);
         assert!(reader.is_eof().unwrap());
         let mut buf = [0; 4];
         assert_eq!(reader.read_bytes(&mut buf).unwrap(), 0);

@@ -21,7 +21,9 @@ use crate::errors::DecodeErrors;
 use crate::mcu::McuContinuation;
 use crate::mcu_prog::get_marker;
 use crate::misc::setup_component_params;
-use crate::progress::{stopped, Progress, ProgressReader};
+#[cfg(not(feature = "std"))]
+use crate::progress::ProgressReader;
+use crate::progress::{stopped, Progress};
 use crate::JpegDecoder;
 
 /// Why a row reader could not be created, read, or restored.
@@ -78,34 +80,75 @@ impl<S: AsRef<[u8]>> AsRef<[u8]> for SharedSource<S> {
     }
 }
 
+/// The input, its reads told to a progress.
 #[cfg(not(feature = "std"))]
-type RowInput<S> = ZCursor<SharedSource<S>>;
+type RowInput<'p, S> = ProgressReader<'p, ZCursor<SharedSource<S>>>;
+
+#[cfg(not(feature = "std"))]
+fn row_input<S: AsRef<[u8]>>(source: SharedSource<S>, progress: &dyn Progress) -> RowInput<'_, S> {
+    ProgressReader::new(ZCursor::new(source), progress)
+}
 
 /// The input read through an 8 KiB buffer. Without it every refill of the entropy
 /// decoder calls `S::as_ref` again, which for a source that resolves its bytes through
-/// shared owners costs more than the decoding.
+/// shared owners costs more than the decoding. Each refill of the buffer is told to
+/// the progress, rather than each of the decoder's reads.
 #[cfg(feature = "std")]
-struct RowInput<S>(std::io::BufReader<std::io::Cursor<SharedSource<S>>>);
+struct RowInput<'p, S>(std::io::BufReader<Refills<'p, std::io::Cursor<SharedSource<S>>>>);
 
 #[cfg(feature = "std")]
-impl<S: AsRef<[u8]>> RowInput<S> {
-    fn new(source: SharedSource<S>) -> Self {
-        Self(std::io::BufReader::with_capacity(
-            8192,
-            std::io::Cursor::new(source),
-        ))
+fn row_input<S: AsRef<[u8]>>(source: SharedSource<S>, progress: &dyn Progress) -> RowInput<'_, S> {
+    RowInput(std::io::BufReader::with_capacity(
+        8192,
+        Refills {
+            inner: std::io::Cursor::new(source),
+            progress,
+            stopped: false,
+        },
+    ))
+}
+
+/// A reader that tells `progress` the bytes of each read, at least one for a read
+/// that found no more, and reads as ended once it stops.
+#[cfg(feature = "std")]
+struct Refills<'p, R> {
+    inner: R,
+    progress: &'p dyn Progress,
+    stopped: bool,
+}
+
+#[cfg(feature = "std")]
+impl<R: std::io::Read> std::io::Read for Refills<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.stopped {
+            return Ok(0);
+        }
+        let read = self.inner.read(buf)?;
+        self.stopped = self.progress.advance(read.max(1));
+        Ok(read)
     }
 }
 
 #[cfg(feature = "std")]
-impl<S: AsRef<[u8]>> std::io::Read for RowInput<S> {
+impl<R: std::io::Seek> std::io::Seek for Refills<'_, R> {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(position)
+    }
+
+    fn stream_position(&mut self) -> std::io::Result<u64> {
+        self.inner.stream_position()
+    }
+}
+
+#[cfg(feature = "std")]
+impl<S: AsRef<[u8]>> std::io::Read for RowInput<'_, S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.0.read(buf)
     }
 }
 
 #[cfg(feature = "std")]
-impl<S: AsRef<[u8]>> std::io::BufRead for RowInput<S> {
+impl<S: AsRef<[u8]>> std::io::BufRead for RowInput<'_, S> {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
         self.0.fill_buf()
     }
@@ -116,7 +159,7 @@ impl<S: AsRef<[u8]>> std::io::BufRead for RowInput<S> {
 }
 
 #[cfg(feature = "std")]
-impl<S: AsRef<[u8]>> std::io::Seek for RowInput<S> {
+impl<S: AsRef<[u8]>> std::io::Seek for RowInput<'_, S> {
     fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
         match position {
             // The marker lookahead steps back often; `BufReader::seek` would drop the
@@ -145,7 +188,7 @@ impl<S: AsRef<[u8]>> std::io::Seek for RowInput<S> {
 pub struct GrayscaleRows<'p, S> {
     source: Arc<Source<S>>,
     progress: &'p dyn Progress,
-    decoder: JpegDecoder<ProgressReader<'p, RowInput<S>>>,
+    decoder: JpegDecoder<RowInput<'p, S>>,
     bits: BitStream,
     next_row: usize,
     /// The data ended (or broke off, when not strict); the remaining rows are 128.
@@ -204,7 +247,7 @@ impl<'p, S: AsRef<[u8]>> GrayscaleRows<'p, S> {
     }
 
     fn at_first_row(
-        source: Arc<Source<S>>, mut decoder: JpegDecoder<ProgressReader<'p, RowInput<S>>>,
+        source: Arc<Source<S>>, mut decoder: JpegDecoder<RowInput<'p, S>>,
         progress: &'p dyn Progress,
     ) -> Result<Self, RowDecodeError> {
         setup_component_params(&mut decoder)?;
@@ -394,9 +437,9 @@ impl<S: AsRef<[u8]>> GrayscaleCheckpoint<S> {
 /// the bytes it reads are told to `progress`.
 fn parse_headers<'p, S: AsRef<[u8]>>(
     source: &Arc<Source<S>>, progress: &'p dyn Progress,
-) -> Result<JpegDecoder<ProgressReader<'p, RowInput<S>>>, RowDecodeError> {
+) -> Result<JpegDecoder<RowInput<'p, S>>, RowDecodeError> {
     let mut decoder = JpegDecoder::new_with_options(
-        ProgressReader::new(RowInput::new(SharedSource(Arc::clone(source))), progress),
+        row_input(SharedSource(Arc::clone(source)), progress),
         source.options,
     );
     let parsed = decoder.decode_headers();
@@ -592,13 +635,14 @@ mod input_tests {
     use zune_core::bytestream::{ZByteReaderTrait, ZSeekFrom};
     use zune_core::options::DecoderOptions;
 
-    use super::{RowInput, SharedSource, Source};
+    use super::{row_input, RowInput, SharedSource, Source};
 
-    fn input(bytes: Vec<u8>) -> RowInput<Vec<u8>> {
-        RowInput::new(SharedSource(Arc::new(Source {
+    fn input(bytes: Vec<u8>) -> RowInput<'static, Vec<u8>> {
+        let source = SharedSource(Arc::new(Source {
             bytes,
             options: DecoderOptions::default(),
-        })))
+        }));
+        row_input(source, &())
     }
 
     /// The buffered input keeps the positions, peeks and failed reads of a plain
