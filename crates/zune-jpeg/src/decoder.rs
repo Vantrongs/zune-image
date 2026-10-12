@@ -29,6 +29,7 @@ use crate::huffman::HuffmanTable;
 use crate::idct::{choose_idct_func, choose_idct_1x1_func, choose_idct_4x4_func};
 use crate::marker::Marker;
 use crate::misc::SOFMarkers;
+use crate::progress::Progress;
 use crate::upsampler::{
     choose_horizontal_samp_function, choose_hv_samp_function, choose_v_samp_function,
     generic_sampler, upsample_no_op
@@ -213,10 +214,19 @@ where
     /// # Errors
     /// See DecodeErrors for an explanation
     pub fn decode(&mut self) -> Result<Vec<u8>, DecodeErrors> {
+        self.decode_with_progress(&())
+    }
+
+    /// [`Self::decode`], telling `progress` the work of each row of MCUs; see
+    /// [`Self::decode_into_with_progress`].
+    ///
+    /// # Errors
+    /// See DecodeErrors for an explanation
+    pub fn decode_with_progress(&mut self, progress: &dyn Progress) -> Result<Vec<u8>, DecodeErrors> {
         self.decode_headers()?;
         let size = self.output_buffer_size().unwrap();
         let mut out = vec![0; size];
-        self.decode_into(&mut out)?;
+        self.decode_into_with_progress(&mut out, progress)?;
         Ok(out)
     }
 
@@ -825,6 +835,20 @@ where
     ///
     ///
     pub fn decode_into(&mut self, out: &mut [u8]) -> Result<(), DecodeErrors> {
+        self.decode_into_with_progress(out, &())
+    }
+
+    /// [`Self::decode_into`], telling `progress` the work of each row of MCUs before
+    /// decoding it, and failing with [`DecodeErrors::Stopped`] once it stops. The bytes
+    /// read count too when the input is a [`ProgressReader`](crate::progress::ProgressReader)
+    /// reporting to the same progress; the work between reports is then bounded
+    /// whatever the data.
+    ///
+    /// # Errors
+    /// See DecodeErrors for an explanation
+    pub fn decode_into_with_progress(
+        &mut self, out: &mut [u8], progress: &dyn Progress
+    ) -> Result<(), DecodeErrors> {
         self.decode_headers_internal()?;
 
         let expected_size = self.output_buffer_size().unwrap();
@@ -839,9 +863,9 @@ where
         let out = &mut out[0..out_len];
 
         if self.is_progressive {
-            self.decode_mcu_ycbcr_progressive(out)
+            self.decode_mcu_ycbcr_progressive(out, progress)
         } else {
-            self.decode_mcu_ycbcr_baseline(out)
+            self.decode_mcu_ycbcr_baseline(out, progress)
         }
     }
 

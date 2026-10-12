@@ -51,7 +51,7 @@ fn measure(height: u16) -> (usize, usize) {
     PEAK.set(0);
     COUNTING.set(true);
     let options = DecoderOptions::default().set_max_height(65535);
-    let mut rows = GrayscaleRows::new(Arc::clone(&input), options).unwrap();
+    let mut rows = GrayscaleRows::new(Arc::clone(&input), options, &()).unwrap();
     let mut band = vec![0; rows.output_buffer_size()];
     rows.read_mcu_row(&mut band).unwrap();
     let before = LIVE.get();

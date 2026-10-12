@@ -22,6 +22,7 @@ use crate::errors::DecodeErrors;
 use crate::marker::Marker;
 use crate::mcu_prog::get_marker;
 use crate::misc::{calculate_padded_width, setup_component_params};
+use crate::progress::{advance, Progress};
 use crate::worker::{color_convert, upsample};
 use crate::JpegDecoder;
 
@@ -86,7 +87,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     )]
     #[inline(never)]
     pub(crate) fn decode_mcu_ycbcr_baseline(
-        &mut self, pixels: &mut [u8]
+        &mut self, pixels: &mut [u8], progress: &dyn Progress
     ) -> Result<(), DecodeErrors> {
         setup_component_params(self)?;
 
@@ -189,6 +190,8 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         let is_hv = usize::from(self.is_interleaved);
         let upsampler_scratch_size = is_hv * self.components.iter().map(|x| x.width_stride).max().unwrap_or(0) * 8;
         let mut upsampler_scratch_space = vec![0; upsampler_scratch_size];
+        // The coefficients of a row of MCUs, and the pixels it gives.
+        let row_work = mcu_width * 64 * self.components.len() * self.v_max.max(1) + width * 8;
 
         'sos: loop {
             trace!(
@@ -199,8 +202,9 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             trace!("Decoding MCU width: {mcu_width}, height: {mcu_height}");
 
             for i in 0..mcu_height {
+                advance(progress, row_work)?;
                 if stream.overread_by > 0 {
-                    pixels.get_mut(pixels_written..).map(|v| v.fill(128));
+                    fill_rest(pixels, pixels_written, progress)?;
                     if self.options.strict_mode() {
                         return Err(DecodeErrors::FormatStatic("Premature end of buffer"));
                     };
@@ -279,7 +283,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                     }
                     McuContinuation::Terminate => {
                         warn!("Got terminate signal, will not process further");
-                        pixels.get_mut(pixels_written..).map(|v| v.fill(128));
+                        fill_rest(pixels, pixels_written, progress)?;
                         return Ok(());
                     }
                 }
@@ -291,7 +295,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         }
 
         if !all_components_in_first_scan {
-            self.finish_baseline_decoding(&progressive_mcus, mcu_width, pixels)?;
+            self.finish_baseline_decoding(&progressive_mcus, mcu_width, pixels, progress)?;
         }
 
         // it may happen that some images don't have the whole buffer
@@ -325,7 +329,8 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::cast_sign_loss)]
     pub(crate) fn finish_baseline_decoding(
-        &mut self, block: &[Vec<i16>; MAX_COMPONENTS], _mcu_width: usize, pixels: &mut [u8]
+        &mut self, block: &[Vec<i16>; MAX_COMPONENTS], _mcu_width: usize, pixels: &mut [u8],
+        progress: &dyn Progress
     ) -> Result<(), DecodeErrors> {
         let mcu_height = self.mcu_y;
 
@@ -356,6 +361,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
         // dequantize and idct have been performed, only color convert.
         for i in 0..mcu_height {
+            advance(progress, padded_width * 8 * self.components.len())?;
             // All the data is already in the right order, we just need to be able to pass it to
             // the post_process & upsample method. That expects all the data to be stored as one
             // row of MCUs in each component's `raw_coeff`.
@@ -954,4 +960,13 @@ pub(crate) enum McuContinuation {
     /// The caller should parse it and scan for the next SOS.
     InterScanMarker(Marker),
     Terminate
+}
+
+/// Fills the pixels after `written` with gray, telling `progress` each piece.
+fn fill_rest(pixels: &mut [u8], written: usize, progress: &dyn Progress) -> Result<(), DecodeErrors> {
+    for piece in pixels.get_mut(written..).unwrap_or_default().chunks_mut(1 << 16) {
+        advance(progress, piece.len())?;
+        piece.fill(128);
+    }
+    Ok(())
 }

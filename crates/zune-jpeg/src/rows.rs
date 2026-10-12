@@ -21,6 +21,7 @@ use crate::errors::DecodeErrors;
 use crate::mcu::McuContinuation;
 use crate::mcu_prog::get_marker;
 use crate::misc::setup_component_params;
+use crate::progress::{stopped, Progress, ProgressReader};
 use crate::JpegDecoder;
 
 /// Why a row reader could not be created, read, or restored.
@@ -35,6 +36,9 @@ pub enum RowDecodeError {
     Failed,
     /// The JPEG data is invalid, or the output buffer is too small.
     Decode(DecodeErrors),
+    /// The reader's [`Progress`] stopped it; a read that stopped leaves the reader
+    /// [`RowDecodeError::Failed`].
+    Stopped,
 }
 
 impl fmt::Display for RowDecodeError {
@@ -46,6 +50,7 @@ impl fmt::Display for RowDecodeError {
             Self::ForeignCheckpoint => f.write_str("Checkpoint belongs to another JPEG source"),
             Self::Failed => f.write_str("Restore a checkpoint before reusing a failed row decoder"),
             Self::Decode(e) => fmt::Display::fmt(e, f),
+            Self::Stopped => f.write_str("Row decoding stopped"),
         }
     }
 }
@@ -133,10 +138,14 @@ impl<S: AsRef<[u8]>> std::io::Seek for RowInput<S> {
 ///
 /// `S` must return the same bytes for as long as it lives. It is kept in an `Arc`
 /// shared with the reader's checkpoints, so it need not be `Clone`. Output is luma
-/// whatever output colour space `options` asks for.
-pub struct GrayscaleRows<S> {
+/// whatever output colour space `options` asks for. The reader tells its
+/// [`Progress`] the bytes it reads and each band's size before decoding it, so that
+/// the work between reports is bounded whatever the data, and fails with
+/// [`RowDecodeError::Stopped`] once it stops.
+pub struct GrayscaleRows<'p, S> {
     source: Arc<Source<S>>,
-    decoder: JpegDecoder<RowInput<S>>,
+    progress: &'p dyn Progress,
+    decoder: JpegDecoder<ProgressReader<'p, RowInput<S>>>,
     bits: BitStream,
     next_row: usize,
     /// The data ended (or broke off, when not strict); the remaining rows are 128.
@@ -173,27 +182,30 @@ impl<S> Clone for GrayscaleCheckpoint<S> {
     }
 }
 
-impl<S: AsRef<[u8]>> GrayscaleRows<S> {
+impl<'p, S: AsRef<[u8]>> GrayscaleRows<'p, S> {
     /// Parses the headers and checks, in one pass over the entropy-coded bytes
     /// without decoding them, that no other scan or table follows: such an image is
     /// [`RowDecodeError::Unsupported`] before any row is returned.
-    pub fn new(bytes: S, options: DecoderOptions) -> Result<Self, RowDecodeError> {
+    pub fn new(
+        bytes: S, options: DecoderOptions, progress: &'p dyn Progress,
+    ) -> Result<Self, RowDecodeError> {
         let source = Arc::new(Source {
             bytes,
             options: options.jpeg_set_out_colorspace(ColorSpace::Luma),
         });
-        let mut decoder = parse_headers(&source)?;
+        let mut decoder = parse_headers(&source, progress)?;
         let entropy = source
             .bytes
             .as_ref()
             .get(input_position(&mut decoder)?..)
             .ok_or(DecodeErrors::ExhaustedData)?;
-        validate_single_scan(entropy)?;
-        Self::at_first_row(source, decoder)
+        validate_single_scan(entropy, progress)?;
+        Self::at_first_row(source, decoder, progress)
     }
 
     fn at_first_row(
-        source: Arc<Source<S>>, mut decoder: JpegDecoder<RowInput<S>>,
+        source: Arc<Source<S>>, mut decoder: JpegDecoder<ProgressReader<'p, RowInput<S>>>,
+        progress: &'p dyn Progress,
     ) -> Result<Self, RowDecodeError> {
         setup_component_params(&mut decoder)?;
         decoder.check_tables()?;
@@ -202,6 +214,7 @@ impl<S: AsRef<[u8]>> GrayscaleRows<S> {
         component.raw_coeff = vec![0; component.width_stride * 8];
         Ok(Self {
             source,
+            progress,
             decoder,
             bits: BitStream::new(),
             next_row: 0,
@@ -249,7 +262,15 @@ impl<S: AsRef<[u8]>> GrayscaleRows<S> {
         if size == 0 {
             return Ok(0);
         }
+        if self.progress.advance(size) {
+            return Err(RowDecodeError::Stopped);
+        }
         let result = self.read_band(&mut output[..size]);
+        // A stop ends the input, which the band may have read as data cut short.
+        if stopped(self.progress) {
+            self.failed = true;
+            return Err(RowDecodeError::Stopped);
+        }
         self.failed = result.is_err();
         Ok(result?)
     }
@@ -355,26 +376,34 @@ impl<S: AsRef<[u8]>> GrayscaleCheckpoint<S> {
         core::mem::size_of::<Self>() + self.raw.capacity() * core::mem::size_of::<i16>()
     }
 
-    /// A new reader at this checkpoint, from parsing the headers again; the single-scan
-    /// check of [`GrayscaleRows::new`] is not repeated.
-    pub fn resume(&self) -> Result<GrayscaleRows<S>, RowDecodeError> {
+    /// A new reader at this checkpoint, from parsing the headers again, telling
+    /// `progress` its work; the single-scan check of [`GrayscaleRows::new`] is not
+    /// repeated.
+    pub fn resume<'p>(
+        &self, progress: &'p dyn Progress,
+    ) -> Result<GrayscaleRows<'p, S>, RowDecodeError> {
         let source = Arc::clone(&self.source);
-        let decoder = parse_headers(&source)?;
-        let mut rows = GrayscaleRows::at_first_row(source, decoder)?;
+        let decoder = parse_headers(&source, progress)?;
+        let mut rows = GrayscaleRows::at_first_row(source, decoder, progress)?;
         rows.restore(self)?;
         Ok(rows)
     }
 }
 
-/// A decoder past the headers of `source`, if its image is one rows can be read from.
-fn parse_headers<S: AsRef<[u8]>>(
-    source: &Arc<Source<S>>,
-) -> Result<JpegDecoder<RowInput<S>>, RowDecodeError> {
+/// A decoder past the headers of `source`, if its image is one rows can be read from;
+/// the bytes it reads are told to `progress`.
+fn parse_headers<'p, S: AsRef<[u8]>>(
+    source: &Arc<Source<S>>, progress: &'p dyn Progress,
+) -> Result<JpegDecoder<ProgressReader<'p, RowInput<S>>>, RowDecodeError> {
     let mut decoder = JpegDecoder::new_with_options(
-        RowInput::new(SharedSource(Arc::clone(source))),
+        ProgressReader::new(RowInput::new(SharedSource(Arc::clone(source))), progress),
         source.options,
     );
-    decoder.decode_headers()?;
+    let parsed = decoder.decode_headers();
+    if stopped(progress) {
+        return Err(RowDecodeError::Stopped);
+    }
+    parsed?;
     if decoder.is_progressive
         || decoder.input_colorspace != ColorSpace::Luma
         || decoder.components.len() != 1
@@ -399,19 +428,43 @@ fn input_position<T: zune_core::bytestream::ZByteReaderTrait>(
         .map_err(|_| DecodeErrors::FormatStatic("Input position does not fit usize"))
 }
 
+/// The bytes the single-scan check scans between reports to its progress.
+const SCAN_PIECE: usize = 1 << 16;
+
 /// Accepts entropy-coded data whose markers up to the first EOI are all restarts. A
 /// missing EOI or a dangling 0xFF is left to the entropy decoder, which treats it as
-/// data that ends early.
-fn validate_single_scan(bytes: &[u8]) -> Result<(), RowDecodeError> {
+/// data that ends early. Each piece scanned is told to `progress`.
+fn validate_single_scan(bytes: &[u8], progress: &dyn Progress) -> Result<(), RowDecodeError> {
     let mut position = 0;
-    while let Some(offset) = memchr::memchr(0xff, &bytes[position..]) {
-        position += offset;
-        while bytes.get(position) == Some(&0xff) {
-            position += 1;
+    let mut reported = 0;
+    loop {
+        if position - reported >= SCAN_PIECE {
+            if progress.advance(position - reported) {
+                return Err(RowDecodeError::Stopped);
+            }
+            reported = position;
         }
+        let end = bytes.len().min(position + SCAN_PIECE);
+        let Some(offset) = memchr::memchr(0xff, &bytes[position..end]) else {
+            if end == bytes.len() {
+                break;
+            }
+            position = end;
+            continue;
+        };
+        position += offset + 1;
+        let fill = bytes[position..bytes.len().min(position + SCAN_PIECE)]
+            .iter()
+            .take_while(|&&byte| byte == 0xff)
+            .count();
+        position += fill;
         let Some(&marker) = bytes.get(position) else {
             break;
         };
+        // A run of fill bytes longer than a piece goes on in the next round.
+        if marker == 0xff {
+            continue;
+        }
         position += 1;
         match marker {
             0 | 0xd0..=0xd7 => {}
@@ -425,8 +478,9 @@ fn validate_single_scan(bytes: &[u8]) -> Result<(), RowDecodeError> {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
+    use core::cell::Cell;
 
-    use super::{validate_single_scan, RowDecodeError};
+    use super::{validate_single_scan, Progress, RowDecodeError, SCAN_PIECE};
 
     /// Every marker code, at offsets around the search's vector widths and after
     /// runs of fill bytes.
@@ -439,7 +493,7 @@ mod tests {
                     bytes.resize(offset + fill, 0xff);
                     bytes.extend_from_slice(&[marker, 0, 0x42, 0xff, 0xd9]);
                     let admitted = matches!(marker, 0 | 0xd0..=0xd7 | 0xd9 | 0xff);
-                    let result = validate_single_scan(&bytes);
+                    let result = validate_single_scan(&bytes, &());
                     assert_eq!(
                         result.is_ok(),
                         admitted,
@@ -462,7 +516,10 @@ mod tests {
         }
         bytes.extend_from_slice(&[0xff, 0xff, 0xff, 0xd9]);
         for end in 0..=bytes.len() {
-            assert!(validate_single_scan(&bytes[..end]).is_ok(), "end={end}");
+            assert!(
+                validate_single_scan(&bytes[..end], &()).is_ok(),
+                "end={end}"
+            );
         }
     }
 
@@ -470,7 +527,59 @@ mod tests {
     fn markers_after_the_first_end_are_not_checked() {
         for marker in 0..=u8::MAX {
             let bytes = [0x42, 0xff, 0xff, 0xd9, 0xff, 0xd8, 0xff, marker];
-            assert!(validate_single_scan(&bytes).is_ok(), "marker={marker:02x}");
+            assert!(
+                validate_single_scan(&bytes, &()).is_ok(),
+                "marker={marker:02x}"
+            );
+        }
+    }
+
+    /// Markers and runs of fill bytes across the pieces scanned between reports are
+    /// checked as within one.
+    #[test]
+    fn markers_across_pieces_are_checked() {
+        for (fill, data) in [
+            (3 * SCAN_PIECE, 0),
+            (1, 3 * SCAN_PIECE - 1),
+            (2, 2 * SCAN_PIECE),
+        ] {
+            // After a restart the table marker is checked; after the end it is not.
+            for marker in [0xc4, 0xd3, 0xd9] {
+                let mut bytes = vec![0x42; data];
+                bytes.resize(data + fill, 0xff);
+                bytes.extend_from_slice(&[marker, 0x42, 0xff, 0xc4]);
+                let result = validate_single_scan(&bytes, &());
+                assert_eq!(
+                    result.is_ok(),
+                    marker == 0xd9,
+                    "fill={fill} data={data} marker={marker:02x}"
+                );
+            }
+        }
+    }
+
+    /// The scan reports each piece and stops within one more once its progress does.
+    #[test]
+    fn the_scan_stops_within_a_piece_of_its_progress() {
+        struct Stop(Cell<usize>);
+        impl Progress for Stop {
+            fn advance(&self, work: usize) -> bool {
+                self.0.set(self.0.get() + work);
+                self.0.get() >= SCAN_PIECE
+            }
+        }
+        for byte in [0x42, 0xff] {
+            let bytes = vec![byte; 64 * SCAN_PIECE];
+            let progress = Stop(Cell::new(0));
+            assert!(matches!(
+                validate_single_scan(&bytes, &progress),
+                Err(RowDecodeError::Stopped)
+            ));
+            assert!(
+                progress.0.get() < 3 * SCAN_PIECE,
+                "{byte:02x}: {}",
+                progress.0.get()
+            );
         }
     }
 }

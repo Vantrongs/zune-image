@@ -50,7 +50,9 @@ pub enum DecodeErrors {
     /// Too small output for size
     TooSmallOutput(usize, usize),
 
-    IoErrors(ZByteIoError)
+    IoErrors(ZByteIoError),
+    /// The [`Progress`](crate::progress::Progress) stopped the decoding.
+    Stopped
 }
 
 #[cfg(feature = "std")]
@@ -98,6 +100,7 @@ impl Debug for DecodeErrors {
             ),
             Self::TooSmallOutput(expected, found) => write!(f, "Too small output, expected buffer with at least {expected} bytes but got one with {found} bytes"),
             Self::IoErrors(error)=>write!(f,"I/O errors {error:?}"),
+            Self::Stopped => write!(f, "Decoding stopped"),
         }
     }
 }

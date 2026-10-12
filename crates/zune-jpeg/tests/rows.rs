@@ -21,7 +21,7 @@ fn full(bytes: &[u8], opts: DecoderOptions) -> Result<Vec<u8>, String> {
         .decode()
         .map_err(|e| format!("{e}"))
 }
-fn drain<S: AsRef<[u8]>>(rows: &mut GrayscaleRows<S>) -> Result<Vec<u8>, String> {
+fn drain<S: AsRef<[u8]>>(rows: &mut GrayscaleRows<'_, S>) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     loop {
         let mut band = vec![0; rows.output_buffer_size()];
@@ -54,7 +54,7 @@ fn rows_equal_the_whole_decode_at_edge_sizes_and_restart_intervals() {
             let bytes = fixture(&name);
             let opts = options(false).set_use_unsafe(unsafe_simd);
             let expected = full(&bytes, opts).unwrap();
-            let mut rows = GrayscaleRows::new(bytes, opts).unwrap();
+            let mut rows = GrayscaleRows::new(bytes, opts, &()).unwrap();
             assert_eq!(
                 drain(&mut rows).unwrap(),
                 expected,
@@ -90,7 +90,7 @@ fn checkpoints_restore_buffered_bits_dc_prediction_and_restart_count() {
     // Five MCUs a row and a restart every three: restarts fall inside rows.
     let bytes = fixture("33x41-r3.jpg");
     let expected = full(&bytes, options(false)).unwrap();
-    let mut rows = GrayscaleRows::new(bytes, options(false)).unwrap();
+    let mut rows = GrayscaleRows::new(bytes, options(false), &()).unwrap();
     let mut checkpoints = vec![rows.checkpoint().unwrap()];
     while rows.output_buffer_size() != 0 {
         rows.read_mcu_row(&mut vec![0; rows.output_buffer_size()])
@@ -108,8 +108,8 @@ fn checkpoints_restore_buffered_bits_dc_prediction_and_restart_count() {
     drop(rows);
     let checkpoint = checkpoints[2].clone();
     drop(checkpoints);
-    let mut a = checkpoint.resume().unwrap();
-    let mut b = checkpoint.resume().unwrap();
+    let mut a = checkpoint.resume(&()).unwrap();
+    let mut b = checkpoint.resume(&()).unwrap();
     drop(checkpoint);
     a.read_mcu_row(&mut vec![0; a.output_buffer_size()])
         .unwrap();
@@ -129,7 +129,7 @@ fn checkpoints_resume_across_input_buffer_boundaries() {
         bytes.resize(bytes.len() + usize::from(padding), 0);
         bytes.extend_from_slice(&original[2..]);
         assert_eq!(full(&bytes, options(false)).unwrap(), expected);
-        let mut rows = GrayscaleRows::new(bytes, options(false)).unwrap();
+        let mut rows = GrayscaleRows::new(bytes, options(false), &()).unwrap();
         let mut checkpoints = Vec::new();
         while rows.output_buffer_size() != 0 {
             checkpoints.push(rows.checkpoint().unwrap());
@@ -145,7 +145,7 @@ fn checkpoints_resume_across_input_buffer_boundaries() {
                 expected[checkpoint.next_row() * 257..]
             );
             assert_eq!(
-                drain(&mut checkpoint.resume().unwrap()).unwrap(),
+                drain(&mut checkpoint.resume(&()).unwrap()).unwrap(),
                 expected[checkpoint.next_row() * 257..]
             );
         }
@@ -161,14 +161,14 @@ fn data_cut_anywhere_reads_as_the_whole_decode_and_resumes() {
         for strict in [false, true] {
             let input = &bytes[..end];
             let expected = full(input, options(strict));
-            let mut rows = GrayscaleRows::new(input, options(strict)).unwrap();
+            let mut rows = GrayscaleRows::new(input, options(strict), &()).unwrap();
             let actual = drain(&mut rows);
             assert_eq!(actual, expected, "end={end} strict={strict}");
             if !strict {
-                let mut rows = GrayscaleRows::new(input, options(false)).unwrap();
+                let mut rows = GrayscaleRows::new(input, options(false), &()).unwrap();
                 while rows.output_buffer_size() != 0 {
                     let checkpoint = rows.checkpoint().unwrap();
-                    let mut resumed = checkpoint.resume().unwrap();
+                    let mut resumed = checkpoint.resume(&()).unwrap();
                     let mut a = vec![0; rows.output_buffer_size()];
                     let mut b = vec![0; resumed.output_buffer_size()];
                     let ar = rows.read_mcu_row(&mut a).map_err(|e| format!("{e}"));
@@ -188,13 +188,13 @@ fn data_cut_anywhere_reads_as_the_whole_decode_and_resumes() {
 fn unsupported_images_foreign_checkpoints_and_failed_readers_are_rejected() {
     for name in ["color.jpg", "progressive.jpg"] {
         assert!(matches!(
-            GrayscaleRows::new(fixture(name), options(false)),
+            GrayscaleRows::new(fixture(name), options(false), &()),
             Err(RowDecodeError::Unsupported)
         ));
     }
     let bytes = fixture("33x41-r3.jpg");
-    let mut a = GrayscaleRows::new(bytes.clone(), options(false)).unwrap();
-    let mut b = GrayscaleRows::new(bytes.clone(), options(false)).unwrap();
+    let mut a = GrayscaleRows::new(bytes.clone(), options(false), &()).unwrap();
+    let mut b = GrayscaleRows::new(bytes.clone(), options(false), &()).unwrap();
     let checkpoint = a.checkpoint().unwrap();
     assert!(matches!(
         b.restore(&checkpoint),
@@ -208,7 +208,7 @@ fn unsupported_images_foreign_checkpoints_and_failed_readers_are_rejected() {
         full(&bytes, options(false)).unwrap()
     );
     let truncated = &bytes[..bytes.len() / 2];
-    let mut failed = GrayscaleRows::new(truncated, options(true)).unwrap();
+    let mut failed = GrayscaleRows::new(truncated, options(true), &()).unwrap();
     let checkpoint = failed.checkpoint().unwrap();
     assert!(drain(&mut failed).is_err());
     assert!(matches!(failed.checkpoint(), Err(RowDecodeError::Failed)));
@@ -244,12 +244,13 @@ fn the_source_lives_until_the_last_reader_or_checkpoint_is_dropped() {
             drops: drops.clone(),
         },
         options(false),
+        &(),
     )
     .unwrap();
     let checkpoint = rows.checkpoint().unwrap();
     drop(rows);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
-    let mut resumed = checkpoint.resume().unwrap();
+    let mut resumed = checkpoint.resume(&()).unwrap();
     drop(checkpoint);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     assert_eq!(drain(&mut resumed).unwrap().len(), 33 * 41);
@@ -271,7 +272,7 @@ fn other_scans_and_tables_are_rejected_before_any_row() {
             let mut bytes = original.clone();
             bytes[restart + 1] = marker;
             assert!(matches!(
-                GrayscaleRows::new(bytes, options(false)),
+                GrayscaleRows::new(bytes, options(false), &()),
                 Err(RowDecodeError::Unsupported)
             ));
         }
@@ -279,7 +280,7 @@ fn other_scans_and_tables_are_rejected_before_any_row() {
     let expected = full(&original, options(false)).unwrap();
     let mut concatenated = original.clone();
     concatenated.extend_from_slice(&fixture("progressive.jpg"));
-    let mut rows = GrayscaleRows::new(concatenated, options(false)).unwrap();
+    let mut rows = GrayscaleRows::new(concatenated, options(false), &()).unwrap();
     assert_eq!(drain(&mut rows).unwrap(), expected);
 }
 
@@ -287,14 +288,14 @@ fn other_scans_and_tables_are_rejected_before_any_row() {
 fn readers_resumed_from_one_checkpoint_run_on_other_threads() {
     let bytes = fixture("33x41-r3.jpg");
     let expected = full(&bytes, options(false)).unwrap();
-    let mut rows = GrayscaleRows::new(bytes, options(false)).unwrap();
+    let mut rows = GrayscaleRows::new(bytes, options(false), &()).unwrap();
     rows.read_mcu_row(&mut vec![0; rows.output_buffer_size()])
         .unwrap();
     let checkpoint = rows.checkpoint().unwrap();
     let other = checkpoint.clone();
     drop(rows);
-    let first = std::thread::spawn(move || drain(&mut checkpoint.resume().unwrap()).unwrap());
-    let second = std::thread::spawn(move || drain(&mut other.resume().unwrap()).unwrap());
+    let first = std::thread::spawn(move || drain(&mut checkpoint.resume(&()).unwrap()).unwrap());
+    let second = std::thread::spawn(move || drain(&mut other.resume(&()).unwrap()).unwrap());
     assert_eq!(first.join().unwrap(), expected[8 * 33..]);
     assert_eq!(second.join().unwrap(), expected[8 * 33..]);
 }
@@ -322,12 +323,16 @@ fn the_source_is_asked_for_its_bytes_once_per_input_buffer() {
             accesses: accesses.clone(),
         },
         options(false),
+        &(),
     )
     .unwrap();
     let checkpoint = rows.checkpoint().unwrap();
     assert_eq!(drain(&mut rows).unwrap(), expected);
     assert!(accesses.load(Ordering::Relaxed) <= ceiling);
     accesses.store(0, Ordering::Relaxed);
-    assert_eq!(drain(&mut checkpoint.resume().unwrap()).unwrap(), expected);
+    assert_eq!(
+        drain(&mut checkpoint.resume(&()).unwrap()).unwrap(),
+        expected
+    );
     assert!(accesses.load(Ordering::Relaxed) <= ceiling);
 }

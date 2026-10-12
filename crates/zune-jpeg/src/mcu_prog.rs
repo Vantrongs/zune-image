@@ -36,6 +36,7 @@ use crate::headers::parse_sos;
 use crate::marker::Marker;
 use crate::mcu::DCT_BLOCK;
 use crate::misc::{calculate_padded_width, setup_component_params};
+use crate::progress::{advance, Progress};
 
 impl<T: ZByteReaderTrait> JpegDecoder<T> {
     /// Decode a progressive image
@@ -49,7 +50,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     )]
     #[inline(never)]
     pub(crate) fn decode_mcu_ycbcr_progressive(
-        &mut self, pixels: &mut [u8]
+        &mut self, pixels: &mut [u8], progress: &dyn Progress
     ) -> Result<(), DecodeErrors> {
         setup_component_params(self)?;
 
@@ -108,15 +109,15 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         let mut stream = BitStream::new_progressive(self.succ_low, self.spec_start, self.spec_end);
 
         // there are multiple scans in the stream, this should resolve the first scan
-        let result = self.parse_entropy_coded_data(&mut stream, &mut block);
+        let result = self.parse_entropy_coded_data(&mut stream, &mut block, progress);
 
         if result.is_err() {
-            return if self.options.strict_mode() {
+            return if self.options.strict_mode() || matches!(result, Err(DecodeErrors::Stopped)) {
                 Err(result.err().unwrap())
             } else {
                 error!("{}", result.err().unwrap());
                 // Go process it and return as much as we can, exiting here
-                return self.finish_progressive_decoding(&block, pixels);
+                return self.finish_progressive_decoding(&block, pixels, progress);
             };
         }
 
@@ -143,12 +144,14 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         self.spec_end
                     );
                     // after every SOS, marker, parse data for that scan.
-                    let result = self.parse_entropy_coded_data(&mut stream, &mut block);
+                    let result = self.parse_entropy_coded_data(&mut stream, &mut block, progress);
 
                     // Do not error out too fast, allows the decoder to continue as much as possible
                     // even after errors
                     if result.is_err() {
-                        return if self.options.strict_mode() {
+                        return if self.options.strict_mode()
+                            || matches!(result, Err(DecodeErrors::Stopped))
+                        {
                             Err(result.err().unwrap())
                         } else {
                             error!("{}", result.err().unwrap());
@@ -205,7 +208,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             }
         }
 
-        self.finish_progressive_decoding(&block, pixels)
+        self.finish_progressive_decoding(&block, pixels, progress)
     }
 
     /// Reset progressive parameters
@@ -219,7 +222,8 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
     #[allow(clippy::too_many_lines, clippy::cast_sign_loss)]
     fn parse_entropy_coded_data(
-        &mut self, stream: &mut BitStream, buffer: &mut [Vec<i16>; MAX_COMPONENTS]
+        &mut self, stream: &mut BitStream, buffer: &mut [Vec<i16>; MAX_COMPONENTS],
+        progress: &dyn Progress
     ) -> Result<(), DecodeErrors> {
         self.reset_prog_params(stream);
 
@@ -253,6 +257,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             let mcu_height = (self.info.height as usize * component.vertical_sample).div_ceil(self.v_max * 8);
 
             for i in 0..mcu_height {
+                advance(progress, mcu_width * 64)?;
                 for j in 0..mcu_width {
                     if self.spec_start != 0 && self.succ_high == 0 && stream.eob_run > 0 {
                         // handle EOB runs here.
@@ -376,6 +381,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             // Components shall not be interleaved in progressive mode, except for
             // the DC coefficients in the first scan for each component of a progressive frame.
             for i in 0..self.mcu_y {
+                advance(progress, self.mcu_x * 64 * usize::from(self.num_scans))?;
                 for j in 0..self.mcu_x {
                     // process scan n elements in order
                     for k in 0..self.num_scans {
@@ -471,7 +477,8 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::needless_range_loop, clippy::cast_sign_loss)]
     fn finish_progressive_decoding(
-        &mut self, block: &[Vec<i16>; MAX_COMPONENTS], pixels: &mut [u8]
+        &mut self, block: &[Vec<i16>; MAX_COMPONENTS], pixels: &mut [u8],
+        progress: &dyn Progress
     ) -> Result<(), DecodeErrors> {
         // This function is complicated because we need to replicate
         // the function in mcu.rs
@@ -537,6 +544,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
         // dequantize, idct and color convert.
         for i in 0..mcu_height {
+            advance(progress, padded_width * 8 * self.components.len())?;
             'component: for (position, component) in &mut self.components.iter_mut().enumerate() {
                 if !component.needed {
                     continue 'component;
