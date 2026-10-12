@@ -177,6 +177,7 @@ mod color_convert;
 mod components;
 mod decoder;
 pub mod errors;
+mod extended_xmp;
 mod headers;
 mod huffman;
 pub mod rows;

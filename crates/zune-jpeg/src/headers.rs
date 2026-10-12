@@ -21,8 +21,9 @@ use zune_core::log::{debug, trace, warn};
 use core::cmp::max;
 
 use crate::components::{Components, SampleRatios};
-use crate::decoder::{ExtendedXmpSegment, GainMapInfo, ICCChunk, JpegDecoder, MAX_COMPONENTS};
+use crate::decoder::{GainMapInfo, ICCChunk, JpegDecoder, MAX_COMPONENTS};
 use crate::errors::DecodeErrors;
+use crate::extended_xmp::ExtendedXmpSegment;
 use crate::huffman::HuffmanTable;
 use crate::misc::{SOFMarkers, UN_ZIGZAG};
 
@@ -543,6 +544,7 @@ pub(crate) fn parse_app1<T: ZByteReaderTrait>(
     }
     // length bytes
     length -= 2;
+    let mut extended_xmp = None;
 
     if length > 6 && decoder.stream.peek_at(0, 6)? == b"Exif\x00\x00" {
         trace!("Exif segment present");
@@ -590,12 +592,18 @@ pub(crate) fn parse_app1<T: ZByteReaderTrait>(
             .peek_at(EXTENDED_XMP_HEADER_SIZE, length - EXTENDED_XMP_HEADER_SIZE)?
             .to_vec();
 
-        decoder.extended_xmp_segments.push(ExtendedXmpSegment { offset, total_size, guid, data });
+        extended_xmp = Some(ExtendedXmpSegment { offset, total_size, guid, data });
     } else {
         warn!("Unknown format for APP1 tag, skipping");
     }
 
     decoder.stream.skip(length)?;
+    if let Some(segment) = extended_xmp.filter(|_| !decoder.headers_decoded) {
+        if let Some((guid, data)) = decoder.extended_xmp.add(segment) {
+            decoder.info.extended_xmp = Some(data);
+            decoder.info.extended_xmp_guid = Some(guid);
+        }
+    }
     Ok(())
 }
 
