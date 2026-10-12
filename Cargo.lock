@@ -404,9 +404,9 @@ checksum = "e6506c6c10786659413faa717ceebcb8f70731c0a60cbae39795fdf114519c1a"
 dependencies = [
  "bytemuck",
  "byteorder-lite",
- "moxcms",
+ "moxcms 0.7.10",
  "num-traits",
- "zune-core 0.5.0",
+ "zune-core 0.5.3",
  "zune-jpeg 0.5.6",
 ]
 
@@ -462,9 +462,9 @@ dependencies = [
 
 [[package]]
 name = "jpeg-encoder"
-version = "0.6.1"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b454d911ac55068f53495488d8ccd0646eaa540c033a28ee15b07838afafb01f"
+checksum = "a0370574b86f7eca156b9f298392b5e69a23f8c86f3f865add60bbc2e79467a6"
 
 [[package]]
 name = "js-sys"
@@ -767,6 +767,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "moxcms"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
+dependencies = [
+ "num-traits",
+ "pxfm",
+]
+
+[[package]]
 name = "mozjpeg"
 version = "0.10.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -802,6 +812,12 @@ name = "nanorand"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a51313c5820b0b02bd422f4b44776fbf47961755c74ce64afc73bfad10226c3"
+
+[[package]]
+name = "nanorand"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e3d189da485332e96ba8a5ef646a311871abd7915bf06ac848a9117f19cf6e4"
 
 [[package]]
 name = "nasm-rs"
@@ -891,19 +907,6 @@ name = "pkg-config"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
-
-[[package]]
-name = "png"
-version = "0.17.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82151a2fc869e011c153adc57cf2789ccb8d9906ce52c0b39a6b5697749d7526"
-dependencies = [
- "bitflags 1.3.2",
- "crc32fast",
- "fdeflate",
- "flate2",
- "miniz_oxide",
-]
 
 [[package]]
 name = "png"
@@ -1506,14 +1509,14 @@ dependencies = [
  "libdeflater",
  "libvips",
  "mozjpeg",
- "png 0.18.0",
+ "png",
  "rapid-qoi",
  "spng",
  "zune-hdr",
  "zune-image",
  "zune-imageprocs",
  "zune-inflate",
- "zune-jpeg 0.5.11",
+ "zune-jpeg 0.5.15",
  "zune-png",
  "zune-qoi",
 ]
@@ -1527,17 +1530,17 @@ dependencies = [
  "serde",
  "serde_json",
  "simple_logger",
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
  "zune-image",
  "zune-imageprocs",
 ]
 
 [[package]]
 name = "zune-bmp"
-version = "0.5.0-rc4"
+version = "0.5.2"
 dependencies = [
  "log",
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
 ]
 
 [[package]]
@@ -1545,16 +1548,10 @@ name = "zune-capi"
 version = "0.5.0"
 dependencies = [
  "libc",
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
  "zune-image",
  "zune-imageprocs",
 ]
-
-[[package]]
-name = "zune-core"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "111f7d9820f05fd715df3144e254d6fc02ee4088b0644c0ffd0efc9e6d9d2773"
 
 [[package]]
 name = "zune-core"
@@ -1565,43 +1562,53 @@ dependencies = [
 ]
 
 [[package]]
-name = "zune-farbfeld"
-version = "0.5.0-rc0"
+name = "zune-core"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d56377fd46368984a170bc5aac5567e52ca5da874caa60bea39fcbca78fb658b"
 dependencies = [
- "zune-core 0.5.1",
+ "log",
+ "serde",
+]
+
+[[package]]
+name = "zune-farbfeld"
+version = "0.5.2"
+dependencies = [
+ "zune-core 0.5.3",
 ]
 
 [[package]]
 name = "zune-gif"
 version = "0.5.0-rc0"
 dependencies = [
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
 ]
 
 [[package]]
 name = "zune-hdr"
-version = "0.5.0-rc0"
+version = "0.5.2"
 dependencies = [
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
 ]
 
 [[package]]
 name = "zune-image"
-version = "0.5.0-rc0"
+version = "0.5.0"
 dependencies = [
  "bytemuck",
  "image-webp",
  "jpeg-encoder",
  "jxl-oxide",
  "kamadak-exif",
- "nanorand",
+ "nanorand 0.7.0",
  "num-complex",
  "serde",
  "zune-bmp",
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
  "zune-farbfeld",
  "zune-hdr",
- "zune-jpeg 0.5.11",
+ "zune-jpeg 0.5.15",
  "zune-jpegxl",
  "zune-png",
  "zune-ppm",
@@ -1611,12 +1618,12 @@ dependencies = [
 
 [[package]]
 name = "zune-imageprocs"
-version = "0.5.0-rc0"
+version = "0.5.1"
 dependencies = [
  "kamadak-exif",
- "moxcms",
- "nanorand",
- "zune-core 0.5.1",
+ "moxcms 0.8.1",
+ "nanorand 0.7.0",
+ "zune-core 0.5.3",
  "zune-image",
 ]
 
@@ -1633,54 +1640,53 @@ version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f520eebad972262a1dde0ec455bce4f8b298b1e5154513de58c114c4c54303e8"
 dependencies = [
- "zune-core 0.5.0",
+ "zune-core 0.5.3",
 ]
 
 [[package]]
 name = "zune-jpeg"
-version = "0.5.11"
+version = "0.5.15"
 dependencies = [
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
  "zune-ppm",
 ]
 
 [[package]]
 name = "zune-jpegxl"
-version = "0.5.0-rc1"
+version = "0.5.2"
 dependencies = [
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
 ]
 
 [[package]]
 name = "zune-png"
-version = "0.5.0-rc1"
+version = "0.5.2"
 dependencies = [
- "nanorand",
- "png 0.17.16",
- "spng",
- "zune-core 0.5.1",
+ "nanorand 0.8.0",
+ "png",
+ "zune-core 0.5.3",
  "zune-inflate",
 ]
 
 [[package]]
 name = "zune-ppm"
-version = "0.5.0-rc0"
+version = "0.5.1"
 dependencies = [
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
 ]
 
 [[package]]
 name = "zune-psd"
-version = "0.5.0-rc0"
+version = "0.5.1"
 dependencies = [
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
 ]
 
 [[package]]
 name = "zune-qoi"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
 ]
 
 [[package]]
@@ -1691,9 +1697,9 @@ dependencies = [
  "serde_json",
  "xxhash-rust",
  "zune-bmp",
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
  "zune-inflate",
- "zune-jpeg 0.5.11",
+ "zune-jpeg 0.5.15",
  "zune-png",
  "zune-psd",
 ]
@@ -1708,7 +1714,7 @@ dependencies = [
  "wasm-bindgen-test",
  "wasm-logger",
  "web-time",
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
  "zune-image",
  "zune-imageprocs",
 ]
