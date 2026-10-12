@@ -179,6 +179,7 @@ mod decoder;
 pub mod errors;
 mod headers;
 mod huffman;
+pub mod rows;
 #[cfg(not(fuzzing))]
 mod idct;
 #[cfg(fuzzing)]

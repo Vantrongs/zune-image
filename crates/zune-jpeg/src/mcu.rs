@@ -433,7 +433,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     // constant folding. And constant folding is quite important for performance here as
     // when `not SAMPLED` then the inner loop has exactly one iteration per component in
     // the scan. The difference was ~1% or a bit more.
-    fn inner_decode_mcu_width<const PROGRESSIVE: bool, const SAMPLED: bool>(
+    pub(crate) fn inner_decode_mcu_width<const PROGRESSIVE: bool, const SAMPLED: bool>(
         &mut self, mcu_width: usize, mcu_height: usize, tmp: &mut [i32; 64],
         stream: &mut BitStream, progressive: &mut [Vec<i16>; 4]
     ) -> Result<McuContinuation, DecodeErrors> {
@@ -947,7 +947,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     }
 }
 
-enum McuContinuation {
+pub(crate) enum McuContinuation {
     Ok,
     AnotherSos,
     /// Found an inter-scan marker (DHT/DQT/DRI/COM/APP) that needs handling.
