@@ -840,7 +840,7 @@ where
 
     /// [`Self::decode_into`], telling `progress` the work of each row of MCUs before
     /// decoding it, and failing with [`DecodeErrors::Stopped`] once it stops. The bytes
-    /// read count too when the input is a [`ProgressReader`](crate::progress::ProgressReader)
+    /// read count too when the input is a [`ProgressCursor`](crate::progress::ProgressCursor)
     /// reporting to the same progress; the work between reports is then bounded
     /// whatever the data.
     ///

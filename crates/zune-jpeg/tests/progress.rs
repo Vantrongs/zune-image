@@ -2,7 +2,7 @@
 
 use std::cell::Cell;
 
-use zune_jpeg::progress::{Progress, ProgressReader};
+use zune_jpeg::progress::{Progress, ProgressCursor};
 use zune_jpeg::rows::{GrayscaleRows, RowDecodeError};
 use zune_jpeg::zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions};
 use zune_jpeg::{errors::DecodeErrors, JpegDecoder};
@@ -59,10 +59,8 @@ fn whole_decoding_stops_with_its_progress() {
             work: Cell::new(0),
             limit,
         };
-        let mut decoder = JpegDecoder::new_with_options(
-            ProgressReader::new(ZCursor::new(&bytes), &progress),
-            options(),
-        );
+        let mut decoder =
+            JpegDecoder::new_with_options(ProgressCursor::new(&bytes, &progress), options());
         let result = decoder.decode_with_progress(&progress);
         assert!(
             matches!(result, Err(DecodeErrors::Stopped)),
@@ -76,11 +74,8 @@ fn whole_decoding_stops_with_its_progress() {
             work: Cell::new(0),
             limit: usize::MAX,
         };
-        let reported = JpegDecoder::new_with_options(
-            ProgressReader::new(ZCursor::new(&bytes), &none),
-            options(),
-        )
-        .decode_with_progress(&none);
+        let reported = JpegDecoder::new_with_options(ProgressCursor::new(&bytes, &none), options())
+            .decode_with_progress(&none);
         assert_eq!(reported.ok(), unstopped.ok(), "{name}");
     }
 }

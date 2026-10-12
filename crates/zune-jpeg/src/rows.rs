@@ -11,8 +11,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
-#[cfg(not(feature = "std"))]
-use zune_core::bytestream::ZCursor;
+#[cfg(feature = "std")]
+use zune_core::bytestream::{ZByteIoError, ZByteReaderTrait, ZSeekFrom};
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
 
@@ -22,7 +22,7 @@ use crate::mcu::McuContinuation;
 use crate::mcu_prog::get_marker;
 use crate::misc::setup_component_params;
 #[cfg(not(feature = "std"))]
-use crate::progress::ProgressReader;
+use crate::progress::ProgressCursor;
 use crate::progress::{stopped, Progress};
 use crate::JpegDecoder;
 
@@ -82,11 +82,11 @@ impl<S: AsRef<[u8]>> AsRef<[u8]> for SharedSource<S> {
 
 /// The input, its reads told to a progress.
 #[cfg(not(feature = "std"))]
-type RowInput<'p, S> = ProgressReader<'p, ZCursor<SharedSource<S>>>;
+type RowInput<'p, S> = ProgressCursor<'p, SharedSource<S>>;
 
 #[cfg(not(feature = "std"))]
 fn row_input<S: AsRef<[u8]>>(source: SharedSource<S>, progress: &dyn Progress) -> RowInput<'_, S> {
-    ProgressReader::new(ZCursor::new(source), progress)
+    ProgressCursor::new(source, progress)
 }
 
 /// The input read through an 8 KiB buffer. Without it every refill of the entropy
@@ -140,40 +140,82 @@ impl<R: std::io::Seek> std::io::Seek for Refills<'_, R> {
     }
 }
 
+/// Reads within the buffer copy from it in place, without a call per read; the rest
+/// go through `BufReader` as `zune_core`'s reader of any `BufRead` would.
 #[cfg(feature = "std")]
-impl<S: AsRef<[u8]>> std::io::Read for RowInput<'_, S> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buf)
-    }
-}
-
-#[cfg(feature = "std")]
-impl<S: AsRef<[u8]>> std::io::BufRead for RowInput<'_, S> {
-    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-        self.0.fill_buf()
+impl<S: AsRef<[u8]>> ZByteReaderTrait for RowInput<'_, S> {
+    #[inline(always)]
+    fn read_byte_no_error(&mut self) -> u8 {
+        let mut byte = [0];
+        let _ = self.read_bytes(&mut byte);
+        byte[0]
     }
 
-    fn consume(&mut self, amount: usize) {
-        self.0.consume(amount);
+    #[inline(always)]
+    fn read_exact_bytes(&mut self, buf: &mut [u8]) -> Result<(), ZByteIoError> {
+        let mut read = 0;
+        while read < buf.len() {
+            match self.read_bytes(&mut buf[read..])? {
+                0 => {
+                    self.0.seek_relative(-i64::try_from(read)?)?;
+                    return Err(ZByteIoError::NotEnoughBytes(read, buf.len()));
+                }
+                bytes => read += bytes,
+            }
+        }
+        Ok(())
     }
-}
 
-#[cfg(feature = "std")]
-impl<S: AsRef<[u8]>> std::io::Seek for RowInput<'_, S> {
-    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
-        match position {
+    #[inline(always)]
+    fn read_bytes(&mut self, buf: &mut [u8]) -> Result<usize, ZByteIoError> {
+        if let Some(bytes) = self.0.buffer().get(..buf.len()) {
+            buf.copy_from_slice(bytes);
+            std::io::BufRead::consume(&mut self.0, buf.len());
+            return Ok(buf.len());
+        }
+        Ok(std::io::Read::read(&mut self.0, buf)?)
+    }
+
+    fn peek_bytes(&mut self, buf: &mut [u8]) -> Result<usize, ZByteIoError> {
+        let read = self.read_bytes(buf)?;
+        self.0.seek_relative(-i64::try_from(read)?)?;
+        Ok(read)
+    }
+
+    fn peek_exact_bytes(&mut self, buf: &mut [u8]) -> Result<(), ZByteIoError> {
+        self.read_exact_bytes(buf)?;
+        self.0.seek_relative(-i64::try_from(buf.len())?)?;
+        Ok(())
+    }
+
+    fn z_seek(&mut self, from: ZSeekFrom) -> Result<u64, ZByteIoError> {
+        let position = match from {
             // The marker lookahead steps back often; `BufReader::seek` would drop the
             // buffer each time.
-            std::io::SeekFrom::Current(offset) => {
+            ZSeekFrom::Current(offset) => {
                 self.0.seek_relative(offset)?;
-                self.0.stream_position()
+                return self.z_position();
             }
-            _ => self.0.seek(position),
-        }
+            ZSeekFrom::Start(offset) => std::io::SeekFrom::Start(offset),
+            ZSeekFrom::End(offset) => std::io::SeekFrom::End(offset),
+        };
+        Ok(std::io::Seek::seek(&mut self.0, position)?)
     }
 
-    fn stream_position(&mut self) -> std::io::Result<u64> {
-        self.0.stream_position()
+    #[inline(always)]
+    fn is_eof(&mut self) -> Result<bool, ZByteIoError> {
+        if !self.0.buffer().is_empty() {
+            return Ok(false);
+        }
+        Ok(std::io::BufRead::fill_buf(&mut self.0)?.is_empty())
+    }
+
+    fn z_position(&mut self) -> Result<u64, ZByteIoError> {
+        Ok(std::io::Seek::stream_position(&mut self.0)?)
+    }
+
+    fn read_remaining(&mut self, sink: &mut Vec<u8>) -> Result<usize, ZByteIoError> {
+        Ok(std::io::Read::read_to_end(&mut self.0, sink)?)
     }
 }
 
