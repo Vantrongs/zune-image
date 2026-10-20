@@ -771,7 +771,7 @@ dependencies = [
  "num-traits",
  "ravif",
  "rayon",
- "zune-core 0.5.0",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "zune-jpeg 0.5.6",
 ]
 
@@ -2463,7 +2463,7 @@ dependencies = [
  "zune-image",
  "zune-imageprocs",
  "zune-inflate 0.2.0",
- "zune-jpeg 0.5.16-rc3",
+ "zune-jpeg 0.5.16",
  "zune-png",
  "zune-qoi",
 ]
@@ -2479,7 +2479,7 @@ dependencies = [
  "serde_json",
  "simple_logger",
  "ureq",
- "zune-core 0.5.3",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "zune-image",
  "zune-imageprocs",
 ]
@@ -2488,7 +2488,7 @@ dependencies = [
 name = "zune-bmp"
 version = "0.5.2"
 dependencies = [
- "zune-core 0.5.3",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -2496,16 +2496,10 @@ name = "zune-capi"
 version = "0.5.0"
 dependencies = [
  "libc",
- "zune-core 0.5.3",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "zune-image",
  "zune-imageprocs",
 ]
-
-[[package]]
-name = "zune-core"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "111f7d9820f05fd715df3144e254d6fc02ee4088b0644c0ffd0efc9e6d9d2773"
 
 [[package]]
 name = "zune-core"
@@ -2516,31 +2510,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "zune-core"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d56377fd46368984a170bc5aac5567e52ca5da874caa60bea39fcbca78fb658b"
+dependencies = [
+ "log",
+ "serde",
+]
+
+[[package]]
 name = "zune-farbfeld"
 version = "0.5.2"
 dependencies = [
- "zune-core 0.5.3",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "zune-gif"
 version = "0.5.0-rc0"
 dependencies = [
- "zune-core 0.5.3",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "zune-hdr"
 version = "0.5.2"
 dependencies = [
- "zune-core 0.5.3",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "zune-heic"
 version = "0.5.0"
 dependencies = [
- "zune-core 0.5.3",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "zune-isobmff",
  "zune-png",
 ]
@@ -2564,11 +2568,11 @@ dependencies = [
  "serde",
  "ureq",
  "zune-bmp",
- "zune-core 0.5.3",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "zune-farbfeld",
  "zune-hdr",
  "zune-heic",
- "zune-jpeg 0.5.16-rc3",
+ "zune-jpeg 0.5.16",
  "zune-jpegxl",
  "zune-png",
  "zune-ppm",
@@ -2585,7 +2589,7 @@ dependencies = [
  "moxcms",
  "nanorand",
  "rayon",
- "zune-core 0.5.3",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "zune-image",
 ]
 
@@ -2611,7 +2615,7 @@ dependencies = [
 name = "zune-isobmff"
 version = "0.5.0"
 dependencies = [
- "zune-core 0.5.3",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -2620,22 +2624,22 @@ version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f520eebad972262a1dde0ec455bce4f8b298b1e5154513de58c114c4c54303e8"
 dependencies = [
- "zune-core 0.5.0",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "zune-jpeg"
-version = "0.5.16-rc3"
+version = "0.5.16"
 dependencies = [
  "memchr",
- "zune-core 0.5.3",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "zune-jpegxl"
 version = "0.5.2"
 dependencies = [
- "zune-core 0.5.3",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -2644,7 +2648,7 @@ version = "0.5.2"
 dependencies = [
  "nanorand",
  "png",
- "zune-core 0.5.3",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "zune-inflate 0.2.0",
 ]
 
@@ -2652,21 +2656,21 @@ dependencies = [
 name = "zune-ppm"
 version = "0.5.1"
 dependencies = [
- "zune-core 0.5.3",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "zune-psd"
 version = "0.5.1"
 dependencies = [
- "zune-core 0.5.3",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "zune-qoi"
 version = "0.5.2"
 dependencies = [
- "zune-core 0.5.3",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -2677,9 +2681,9 @@ dependencies = [
  "serde_json",
  "xxhash-rust",
  "zune-bmp",
- "zune-core 0.5.3",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "zune-inflate 0.2.0",
- "zune-jpeg 0.5.16-rc3",
+ "zune-jpeg 0.5.16",
  "zune-png",
  "zune-psd",
 ]
@@ -2692,7 +2696,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-logger",
  "web-time",
- "zune-core 0.5.3",
+ "zune-core 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "zune-image",
  "zune-imageprocs",
 ]

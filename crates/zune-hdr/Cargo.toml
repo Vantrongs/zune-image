@@ -15,4 +15,4 @@ license = "MIT OR Apache-2.0 OR Zlib"
 log = ["zune-core/log"]
 
 [dependencies]
-zune-core = { version = "^0.5.1", path = "../zune-core", default-features = false, features = ["std"] }
+zune-core = { version = "0.5.3", default-features = false, features = ["std"] }

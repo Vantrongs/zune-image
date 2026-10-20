@@ -11,4 +11,4 @@ categories = ["multimedia", "parser-implementations", "no-std"]
 description = "ISO Base Media File Format (ISOBMFF) box header parsing, shared by the zune HEIF decoders"
 
 [dependencies]
-zune-core = { version = "0.5.1", path = "../zune-core" }
+zune-core = { version = "0.5.3" }
