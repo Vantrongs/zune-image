@@ -35,3 +35,5 @@ zune-core = { version = "0.5.3" }
 
 
 [dev-dependencies]
+jpeg-encoder = { version = "0.7.0", default-features = false, features = ["std"] }
+jpeg-decoder = { version = "0.3.2", default-features = false }

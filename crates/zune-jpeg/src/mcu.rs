@@ -288,6 +288,9 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             } else {
                 scans_seen = scans_seen.saturating_add(1);
                 self.set_baseline_scans_seen(scans_seen);
+                // Each scan counts its restart interval from its own first MCU.
+                self.todo =
+                    if self.restart_interval == 0 { 0x7fff_ffff } else { self.restart_interval };
             }
             if scans_seen > self.options.jpeg_get_max_scans() {
                 return Err(DecodeErrors::Format(format!(
@@ -1301,8 +1304,12 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 // https://github.com/google/libultrahdr
                 *stream.seen_eoi() = true;
             } else if let Marker::RST(_) = m {
-                // A latched RST means the entropy segment is already exhausted.
-                self.handle_rst(stream)?;
+                // The bitstream latches a marker when its refill reaches it, while
+                // bits of the interval's remaining MCUs may still be buffered: the
+                // restart is taken only once the interval is decoded.
+                if self.todo == 0 {
+                    self.handle_rst(stream)?;
+                }
             } else if let Marker::SOS = m {
                 self.parse_marker_inner(Marker::SOS)?;
                 self.invalidate_scan_checkpoint();
