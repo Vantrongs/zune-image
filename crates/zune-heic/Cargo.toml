@@ -1,0 +1,40 @@
+[package]
+name = "zune-heic"
+version = "0.5.0"
+rust-version = "1.89.0"
+authors = ["caleb <etemesicaleb@gmail.com>"]
+edition = "2024"
+repository = "https://github.com/etemesi254/zune-image/tree/dev/crates/zune-heic"
+license = "MIT OR Apache-2.0 OR Zlib"
+keywords = ["heic", "heif", "hevc", "decoder", "image"]
+categories = ["multimedia::images", "no-std"]
+exclude = ["/fuzz/*", "/fuzz-samples/*", "/tests/*", "/test-output/*", "/test-hardware-decoder/*", "/.idea/*"]
+description = "A fast, correct and safe HEIF/HEIC decoder, with its own HEVC decoder"
+
+[dependencies]
+zune-core = { version = "^0.5.3", path = "../zune-core" }
+zune-isobmff = { version = "0.5", path = "../zune-isobmff" }
+
+[features]
+simd = []
+# Standard library support: multi-threaded decoding (grid tiles in parallel,
+# WPP CTU rows in parallel), runtime CPU feature detection and the Apple
+# VideoToolbox decoder. Without it the crate is `#![no_std]` (+ `alloc`).
+std = ["zune-core/std"]
+default = ["std"]
+# `HeifDecoder::decode_tiles_yuv`: each coded image's HEVC bitstream and its
+# decoded planes, for checking the HEVC decoder against a reference decoder
+dump-tiles = []
+
+
+[dev-dependencies]
+# reads libheif's PNG output in examples/compare_libheif.rs
+zune-png = { path = "../zune-png" }
+# The benchmark against libheif and the `heic` crate lives in
+# `benchmarks/benches/decode_heic.rs` (crate `zune-benches`), so that
+# building this crate's tests does not need the system libheif.
+
+
+[[example]]
+name = "dump_tiles"
+required-features = ["dump-tiles"]

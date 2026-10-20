@@ -74,7 +74,7 @@ impl Debug for PPMDecodeErrors {
                 )
             }
             Self::IoErrors(err) => {
-                writeln!(f, "{:?}", err)
+                writeln!(f, "{err:?}")
             }
         }
     }
@@ -136,7 +136,7 @@ where
     /// - `()` : On successful decode, items can be accessed by accessors
     ///
     /// - `Err(PPMDecodeErrors)`: This will return an `InvalidHeader`  enum, the string
-    /// will more information about what went wrong
+    ///   will more information about what went wrong
     ///
     /// [`get_dimensions`]:Self::dimensions
     pub fn decode_headers(&mut self) -> Result<(), PPMDecodeErrors> {
@@ -192,7 +192,7 @@ where
         if self.height > self.options.max_height() {
             let msg = format!(
                 "Height {} greater than max height {}",
-                self.width,
+                self.height,
                 self.options.max_height()
             );
             return Err(PPMDecodeErrors::Generic(msg));
@@ -364,7 +364,7 @@ where
             b'6' => ColorSpace::RGB,
             _ => unreachable!()
         };
-        trace!("Colorspace: {:?}", colorspace);
+        trace!("Colorspace: {colorspace:?}");
 
         self.colorspace = colorspace;
 
@@ -446,7 +446,7 @@ where
     /// # Returns
     /// - `Some(BitDepth)`: The image bit depth, can be Eight or Sixteen, or F32 for (.pfm files)
     /// - `None`: Indicates the header wasn't decoded or there was an unhandled error
-    /// in parsing
+    ///   in parsing
     ///
     pub const fn bit_depth(&self) -> Option<BitDepth> {
         if self.decoded_headers {
@@ -461,7 +461,7 @@ where
     /// # Returns
     /// - `Some(ColorSpace)`: The colorspace of the input image
     /// - None: Indicates headers weren't decoded or an unhandled error occurred
-    /// during header decoding
+    ///   during header decoding
     pub const fn colorspace(&self) -> Option<ColorSpace> {
         if self.decoded_headers {
             Some(self.colorspace)
@@ -503,8 +503,8 @@ where
     ///
     /// # Returns
     /// - `Ok(DecodingResult)`: This is a simple enum that can hold either
-    /// eight or 16 bits ([`u8`] or [`u16`]) singe ppm images can either be 8 bit or 16 bit.
-    ///    It can also return `DecodingResult::F32` in case of decoding PFM  images
+    ///   eight or 16 bits ([`u8`] or [`u16`]) singe ppm images can either be 8 bit or 16 bit.
+    ///   It can also return `DecodingResult::F32` in case of decoding PFM  images
     ///
     ///  -  Err(PPMDecodeErrors)`: There was a problem
     /// # Example
@@ -541,7 +541,7 @@ where
         let size =
             self.width * self.height * self.colorspace.num_components() * self.bit_depth.size_of();
 
-        return match self.bit_depth.bit_type() {
+        match self.bit_depth.bit_type() {
             BitType::U8 => {
                 let mut data = vec![0; size];
                 // get the bytes
@@ -616,7 +616,7 @@ where
                 Ok(DecodingResult::F32(result))
             }
             _ => unreachable!()
-        };
+        }
     }
 }
 

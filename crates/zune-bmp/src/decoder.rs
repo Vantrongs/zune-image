@@ -98,11 +98,10 @@
 use alloc::vec::Vec;
 use alloc::{format, vec};
 
-use log::error;
 use zune_core::bit_depth::BitDepth;
 use zune_core::bytestream::{ZByteIoError, ZByteReaderTrait, ZReader};
 use zune_core::colorspace::{ColorPrimaries, ColorSpace, RenderingIntent};
-use zune_core::log::{trace, warn};
+use zune_core::log::{error, trace, warn};
 use zune_core::options::DecoderOptions;
 
 use crate::common::{BmpCompression, BmpPixelFormat, PROFILE_EMBEDDED, PROFILE_LINKED};
@@ -282,7 +281,7 @@ where
     /// # Returns
     /// - Ok(()) Indicates everything was okay during header parsing
     /// - Err: Error that occurred when decoding headers
-    #[allow(unused_assignments,unused_variables)]
+    #[allow(unused_assignments, unused_variables)]
     pub fn decode_headers(&mut self) -> Result<(), BmpDecoderErrors> {
         if self.decoded_headers {
             return Ok(());
@@ -339,11 +338,11 @@ where
                     let color_used = self.bytes.get_u32_le_err()?;
                     let important_colors = self.bytes.get_u32_le_err()?;
 
-                    trace!("Image size {}", size);
-                    trace!("X Pixels: {}", x_pixels);
-                    trace!("Y Pixels: {}", y_pixels);
-                    trace!("Color used : {}", color_used);
-                    trace!("Important Colors: {}", important_colors);
+                    trace!("Image size {size}");
+                    trace!("X Pixels: {x_pixels}");
+                    trace!("Y Pixels: {y_pixels}");
+                    trace!("Color used : {color_used}");
+                    trace!("Important Colors: {important_colors}");
 
                     self.rgb_bitfields[0] = self.bytes.get_u32_le_err()?;
                     self.rgb_bitfields[1] = self.bytes.get_u32_le_err()?;
@@ -389,11 +388,11 @@ where
                             8 => intent = Some(RenderingIntent::Perceptual),
                             _ => {}
                         }
-                        trace!("Intent :{:?}", intent);
+                        trace!("Intent :{intent:?}");
                         let profile_data = self.bytes.get_u32_le_err()?;
                         let profile_size = self.bytes.get_u32_le_err()?;
-                        trace!("ICC profile Data Offset: {}", profile_data);
-                        trace!("ICC profile data size: {}", profile_size);
+                        trace!("ICC profile Data Offset: {profile_data}");
+                        trace!("ICC profile data size: {profile_size}");
                         // The offset, in bytes, from the beginning of the
                         // BITMAPV5HEADER structure to the start of the profile data.
                         let true_position = beginning_of_header + profile_data as u64;
@@ -408,7 +407,7 @@ where
                         // that all headers are decoded after calling decode_header()
 
                         let icc_bytes = self.bytes.peek_at(
-                            (true_position.saturating_sub(current_pos)) as usize,
+                            true_position.saturating_sub(current_pos) as usize,
                             profile_size as usize
                         );
                         match icc_bytes {
@@ -431,7 +430,7 @@ where
                                 }
                             }
                             Err(e) => {
-                                error!("Error reading ICC profile. {:?}", e);
+                                error!("Error reading ICC profile. {e:?}");
                             }
                         }
                     }
@@ -534,11 +533,11 @@ where
                 let t = self.bytes.get_u32_le_err()? as i32;
 
                 if t < 0 || t > (1 << bpp) {
-                    let msg = format!("Incorrect number of colors {} for depth {}", t, bpp);
+                    let msg = format!("Incorrect number of colors {t} for depth {bpp}");
                     if self.options.strict_mode() {
                         return Err(BmpDecoderErrors::Generic(msg));
                     }
-                    warn!("{}", msg);
+                    warn!("{msg}");
                 } else if t != 0 {
                     colors = t as u32;
                 }
@@ -556,10 +555,7 @@ where
                 self.palette.resize(256, PaletteEntry::default());
 
                 self.palette.iter_mut().take(colors as usize).for_each(|x| {
-                    let [b, g, r] = self
-                        .bytes
-                        .read_fixed_bytes_or_error::<3>()
-                        .unwrap_or([0, 0, 0]);
+                    let [b, g, r] = self.bytes.read_fixed_bytes_or_zero::<3>();
 
                     x.red = r;
                     x.green = g;
@@ -586,8 +582,8 @@ where
         }
 
         trace!("Pixel format : {:?}", self.pix_fmt);
-        trace!("Compression  : {:?}", compression);
-        trace!("Bit depth: {:?}", bpp);
+        trace!("Compression  : {compression:?}");
+        trace!("Bit depth: {bpp:?}");
         self.comp = compression;
         self.depth = bpp;
         self.ihszie = ihsize;
@@ -628,7 +624,7 @@ where
     /// # Returns
     /// - `Some((width,height))`  - The image dimensions
     /// - `None`: Indicates that the image headers weren't decoded
-    ///    or an error occurred during decoding the headers   
+    ///   or an error occurred during decoding the headers   
     pub fn dimensions(&self) -> Option<(usize, usize)> {
         if !self.decoded_headers {
             return None;
@@ -640,7 +636,7 @@ where
     /// # Returns
     /// - `Some(colorspace)`: The colorspace of the image
     /// - `None`: Indicates headers weren't decoded or an error occured
-    /// during decoding of headers
+    ///   during decoding of headers
     pub fn colorspace(&self) -> Option<ColorSpace> {
         if !self.decoded_headers {
             return None;
@@ -863,7 +859,7 @@ where
                                     //
                                     // this does ceil division to ensure input is appropriately rounded
                                     // of to a multiple of 4 to handle pad bytes in BMP
-                                    let input_bytes_per_width = (((num_iters * 2) + 3) / 4) * 4;
+                                    let input_bytes_per_width = (num_iters * 2).div_ceil(4) * 4;
 
                                     // we chunk according to number of iterations, which is usually the
                                     // image dimensions (w*h*color components), this is given by the size of
@@ -938,7 +934,7 @@ where
 
                     // temporary location for an scaled down image width, bytes are read here
                     // before expanding them in a separate pass
-                    let in_width_bytes = ((self.width * usize::from(self.depth)) + 7) / 8;
+                    let in_width_bytes = (self.width * usize::from(self.depth)).div_ceil(8);
                     let mut in_width_buf = vec![0_u8; in_width_bytes];
 
                     let scanline_size = width_bytes * 3;
@@ -1016,7 +1012,9 @@ where
                         pix.swap(0, 2);
                     }
                 }
-                _ => error!("Unhandled pixel format")
+                _ => {
+                    error!("Unhandled pixel format");
+                }
             }
             self.image_in_bgra = true;
         }
@@ -1031,8 +1029,8 @@ where
     /// - in_bytes: Palette entry indices
     /// - buf: Where to write the bytes to
     /// - unpad: Whether to take padding bytes into account, this is important since
-    ///  callers like RLE bytes do not take padding into account but for non-rle data
-    /// we must take it into account
+    ///   callers like RLE bytes do not take padding into account but for non-rle data
+    ///   we must take it into account
     ///
     fn expand_palette(&self, in_bytes: &[u8], buf: &mut [u8], unpad: bool) {
         let palette: &[PaletteEntry; 256] = &self.palette[0..256].try_into().unwrap();
@@ -1213,7 +1211,7 @@ where
                     } else {
                         // copy pixels from encoded stream
                         let odd_pixel = usize::from(stream_byte & 1);
-                        rle_code = (u16::from(stream_byte) + 1) / 2;
+                        rle_code = u16::from(stream_byte).div_ceil(2);
                         let extra_byte = usize::from(rle_code & 0x01);
 
                         for i in 0..rle_code {
@@ -1273,11 +1271,10 @@ where
                         // end of line
                         line -= 1;
                         if line < 0 {
-                            return if self.bytes.get_u16_be() == 1 {
+                            return if self.bytes.get_u16_be_err()? == 1 {
                                 // end of picture
                                 Ok(pixels)
                             } else {
-                                // panic!();
                                 let msg = "Next line is beyond picture bounds";
                                 Err(BmpDecoderErrors::GenericStatic(msg))
                             };

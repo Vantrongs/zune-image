@@ -12,7 +12,7 @@
 //! from one image to another
 
 use zune_core::bit_depth::BitDepth;
-use zune_core::colorspace::{ColorCharacteristics, ColorSpace};
+use zune_core::colorspace::{ColorCharacteristics, ColorPrimaries, ColorSpace};
 
 use crate::codecs::ImageFormat;
 
@@ -24,9 +24,15 @@ mod exif;
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum AlphaState {
     PreMultiplied,
-    NonPreMultiplied
+    NonPreMultiplied,
 }
 
+#[derive(Debug, Clone)]
+pub struct GainMapImage {
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) pixels: Vec<u8>,
+}
 /// Image metadata
 ///
 /// Each image type has this information present
@@ -36,20 +42,28 @@ pub enum AlphaState {
 pub struct ImageMetadata {
     // REMEMBER: If you add a field here add it's serialization
     // to src/serde
-    pub(crate) color_trc:     Option<ColorCharacteristics>,
+    /// The transfer function/gamma curve (from cICP or sRGB chunks)
+    pub(crate) color_trc: Option<ColorCharacteristics>,
     pub(crate) default_gamma: Option<f32>,
-    pub(crate) width:         usize,
-    pub(crate) height:        usize,
-    pub(crate) colorspace:    ColorSpace,
-    pub(crate) depth:         BitDepth,
-    pub(crate) format:        Option<ImageFormat>,
-    pub(crate) alpha:         AlphaState,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) colorspace: ColorSpace,
+    pub(crate) depth: BitDepth,
+    pub(crate) format: Option<ImageFormat>,
+    pub(crate) alpha: AlphaState,
     #[cfg(feature = "metadata")]
-    pub(crate) exif:          Option<Vec<::exif::Field>>,
-    pub(crate) icc_chunk:     Option<Vec<u8>>,
-    // whether or not the image is in linear colorspace or
-    // rgb
-    pub(crate) is_linear:     bool
+    pub(crate) exif: Option<Vec<::exif::Field>>,
+    pub(crate) icc_chunk: Option<Vec<u8>>,
+    /// whether or not the image is in linear colorspace or gamma encoded
+    pub(crate) is_linear: bool,
+    /// The explicit xy coordinates of the colors (from cHRM)
+    pub(crate) color_primaries: Option<ColorPrimaries>,
+    /// The target color space standard (from cICP color_primaries field, e.g., 9 for Rec2020)
+    pub(crate) color_standard: Option<u8>,
+    /// Maximum Content Light Level in nits (from cLLI chunk)
+    pub(crate) max_cll: Option<u32>,
+    /// Gain map image (currently can be extracted from JPEG)
+    pub(crate) gain_map_image: Option<GainMapImage>,
 }
 
 impl Default for ImageMetadata {
@@ -65,9 +79,12 @@ impl Default for ImageMetadata {
             alpha: AlphaState::NonPreMultiplied,
             #[cfg(feature = "metadata")]
             exif: None,
-
             icc_chunk: None,
-            is_linear: false
+            is_linear: false,
+            color_primaries: None,
+            color_standard: None,
+            max_cll: None,
+            gain_map_image: None,
         }
     }
 }
@@ -80,7 +97,7 @@ impl ImageMetadata {
     #[cfg(feature = "metadata")]
     #[cfg_attr(feature = "docs", doc(cfg(feature = "metadata")))]
     pub const fn exif(&self) -> Option<&Vec<::exif::Field>> {
-        return self.exif.as_ref();
+        self.exif.as_ref()
     }
 
     /// Return a mutable reference to the exif metadata of an image or none if it
@@ -88,9 +105,8 @@ impl ImageMetadata {
     ///
     #[cfg(feature = "metadata")]
     #[cfg_attr(feature = "docs", doc(cfg(feature = "metadata")))]
-
     pub fn exif_mut(&mut self) -> Option<&mut Vec<::exif::Field>> {
-        return self.exif.as_mut();
+        self.exif.as_mut()
     }
     /// Get image dimensions as a tuple of width and height
     ///  

@@ -19,10 +19,9 @@ default = ["console_error_panic_hook"]
 wasm-bindgen = "0.2.63"
 # Time and instant
 web-time = "1.1.0"
-jxl-grid = "0.4.1"
 zune-image = { path = "../zune-image", features = ["image_formats", "serde", "simd"], default-features = false }
-zune-core = { version = "0.5.3" }
-zune-imageprocs = { path = "../zune-imageprocs", default-features = false }
+zune-core = { path = "../zune-core", version = "^0.5.0-rc0" }
+zune-imageprocs = { path = "../zune-imageprocs", default-features = false, features = ["cms", "exif", "exmex"] }
 
 # The `console_error_panic_hook` crate provides better debugging of panics by
 # logging them with `console.error`. This is great for development, but requires
@@ -32,7 +31,6 @@ console_error_panic_hook = { version = "0.1.6", optional = true }
 wasm-logger = "0.2.0"
 
 [dev-dependencies]
-wasm-bindgen-test = "0.3.13"
 
 
 [package.metadata]

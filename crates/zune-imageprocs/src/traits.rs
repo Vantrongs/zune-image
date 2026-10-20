@@ -6,7 +6,12 @@
  * You can redistribute it or modify it under terms of the MIT, Apache License or Zlib license
  */
 
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::cast_possible_wrap
+)]
 //! Various operations useful for generic image processing.
 //!
 //!
@@ -50,6 +55,8 @@ pub trait NumOps<T> {
     /// using an `as` cast
     fn from_i32(x: i32) -> T;
 
+    fn from_i64(x: i64) -> T;
+
     /// Convert an u64 to type T
     /// using an `as` cast
     fn from_u64(x: u64) -> T;
@@ -82,6 +89,10 @@ pub trait NumOps<T> {
     /// Return this number casted to
     /// f32
     fn to_f32(self) -> f32;
+
+    fn to_i32(self) -> i32;
+
+    fn to_i64(self) -> i64;
 }
 
 /// A trait implemented only for floats
@@ -113,11 +124,11 @@ macro_rules! numops_for_int {
             }
             #[inline(always)]
             fn from_f64(x: f64) -> $int {
-                x as $int
+                (x + 0.5) as $int
             }
             #[inline(always)]
             fn from_f32(x: f32) -> $int {
-                x as $int
+                (x + 0.5) as $int
             }
             #[inline(always)]
             fn one() -> $int {
@@ -141,6 +152,10 @@ macro_rules! numops_for_int {
                 x as $int
             }
             #[inline(always)]
+            fn from_i64(x: i64) -> $int {
+                x as $int
+            }
+            #[inline(always)]
             fn saturating_add(self, other: $int) -> $int {
                 self.saturating_add(other)
             }
@@ -154,7 +169,7 @@ macro_rules! numops_for_int {
             }
             #[inline(always)]
             fn to_f64(self) -> f64 {
-                self as f64
+                f64::from(self)
             }
 
             #[inline(always)]
@@ -164,6 +179,14 @@ macro_rules! numops_for_int {
             #[inline(always)]
             fn zclamp(self, min: $int, max: $int) -> $int {
                 <$int>::clamp(self, min, max)
+            }
+            #[inline(always)]
+            fn to_i32(self) -> i32 {
+                self as i32
+            }
+            #[inline(always)]
+            fn to_i64(self) -> i64 {
+                self as i64
             }
         }
     };
@@ -176,68 +199,82 @@ numops_for_int!(i32);
 impl NumOps<f32> for f32 {
     const MAX_VAL: f32 = 1.0;
     const MIN_VAL: f32 = 0.0;
+    #[inline(always)]
     fn max_val() -> f32 {
         1.0
     }
-
+    #[inline(always)]
     fn min_val() -> f32 {
         0.0
     }
-
+    #[inline(always)]
     fn from_u8(x: u8) -> f32 {
         f32::from(x)
     }
-
+    #[inline(always)]
     fn from_u32(x: u32) -> f32 {
         x as f32
     }
-
+    #[inline(always)]
     fn from_f64(x: f64) -> f32 {
         x as f32
     }
-
+    #[inline(always)]
     fn from_f32(x: f32) -> f32 {
         x
     }
-
+    #[inline(always)]
     fn from_usize(x: usize) -> f32 {
         x as f32
     }
-
+    #[inline(always)]
+    fn from_i64(x: i64) -> f32 {
+        x as f32
+    }
+    #[inline(always)]
     fn from_i32(x: i32) -> f32 {
         x as f32
     }
-
+    #[inline(always)]
     fn from_u64(x: u64) -> f32 {
         x as f32
     }
-
+    #[inline(always)]
     fn saturating_add(self, other: f32) -> f32 {
         self + other
     }
-
+    #[inline(always)]
     fn saturating_sub(self, other: f32) -> f32 {
         self - other
     }
-
+    #[inline(always)]
     fn one() -> f32 {
         1.0
     }
-
+    #[inline(always)]
     fn zclamp(self, min: f32, max: f32) -> f32 {
         self.clamp(min, max)
     }
 
+    #[inline(always)]
     #[allow(clippy::cast_sign_loss)]
     fn to_usize(self) -> usize {
         self as _
     }
-
+    #[inline(always)]
     fn to_f64(self) -> f64 {
         f64::from(self)
     }
-
+    #[inline(always)]
     fn to_f32(self) -> f32 {
         self
+    }
+    #[inline(always)]
+    fn to_i32(self) -> i32 {
+        self as i32
+    }
+    #[inline(always)]
+    fn to_i64(self) -> i64 {
+        self as i64
     }
 }

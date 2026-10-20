@@ -14,7 +14,7 @@ libfuzzer-sys = "0.4"
 
 [dependencies.zune-jpeg]
 path = ".."
-features =  ["neon", "x86"]
+features =  ["arith", "neon", "x86"]
 
 # Prevent this from interfering with workspaces
 [workspace]
@@ -29,5 +29,17 @@ doc = false
 [[bin]]
 name = "fuzz_idct"
 path = "fuzz_targets/fuzz_idct.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode_incremental"
+path = "fuzz_targets/decode_incremental.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode_apis"
+path = "fuzz_targets/decode_apis.rs"
 test = false
 doc = false

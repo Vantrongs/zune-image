@@ -69,8 +69,13 @@ fn memory_does_not_grow_with_the_height() {
     assert_eq!(measure(65000), (peak, checkpoint));
     // A checkpoint holds one row of coefficients: 33 blocks of 64 `i16`.
     assert_eq!(checkpoint, 264 * 8 * 2);
-    // That row in the reader and the checkpoint, the output band, the headers, and
-    // with `std` the input buffer.
+    // That row in the reader and the checkpoint, the output band, the headers, with
+    // `std` the input buffer, and the copy of the headers' tables the decoder keeps to
+    // retry a scan: eight Huffman tables of under 4 KiB.
     let input_buffer = if cfg!(feature = "std") { 8192 } else { 0 };
-    assert!(peak <= 40 * 264 + 2048 + input_buffer, "peak {peak}");
+    let header_snapshot = 8 * 4096;
+    assert!(
+        peak <= 40 * 264 + 2048 + input_buffer + header_snapshot,
+        "peak {peak}"
+    );
 }

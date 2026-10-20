@@ -16,7 +16,7 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use zune_benches::sample_path;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
-use zune_jpeg::JpegDecoder;
+use zune_jpeg::{JpegDecoder, RawImcuRowStatus};
 use zune_png::zune_core::bytestream::ZCursor;
 
 fn decode_jpeg(buf: &[u8]) -> Vec<u8> {
@@ -44,12 +44,10 @@ fn decode_jpeg_mozjpeg(buf: &[u8]) -> Vec<[u8; 3]> {
     p
 }
 
-fn decode_no_samp(c: &mut Criterion) {
-    let a = sample_path().join("test-images/jpeg/benchmarks/speed_bench.jpg");
+fn generic_bench<S: AsRef<Path>>(c: &mut Criterion, path: S, name: &str) {
+    let data = read(path).unwrap();
 
-    let data = read(a).unwrap();
-    let mut group = c.benchmark_group("jpeg: No sampling Baseline decode");
-
+    let mut group = c.benchmark_group(name);
     group.throughput(Throughput::Bytes(data.len() as u64));
 
     group.bench_function("zune-jpeg", |b| {
@@ -59,56 +57,38 @@ fn decode_no_samp(c: &mut Criterion) {
     group.bench_function("mozjpeg", |b| {
         b.iter(|| black_box(decode_jpeg_mozjpeg(data.as_slice())))
     });
+}
+
+fn decode_no_samp(c: &mut Criterion) {
+    generic_bench(
+        c,
+        sample_path().join("test-images/jpeg/benchmarks/speed_bench.jpg"),
+        "jpeg: No sampling Baseline decode",
+    );
 }
 
 fn decode_h_samp(c: &mut Criterion) {
-    let data = read(
-        sample_path().join("test-images/jpeg/benchmarks/speed_bench_horizontal_subsampling.jpg")
-    )
-    .unwrap();
-    let mut group = c.benchmark_group("jpeg: Horizontal Sub Sampling");
-    group.throughput(Throughput::Bytes(data.len() as u64));
-
-    group.bench_function("zune-jpeg", |b| {
-        b.iter(|| black_box(decode_jpeg(data.as_slice())))
-    });
-
-    group.bench_function("mozjpeg", |b| {
-        b.iter(|| black_box(decode_jpeg_mozjpeg(data.as_slice())))
-    });
+    generic_bench(
+        c,
+        sample_path().join("test-images/jpeg/benchmarks/speed_bench_horizontal_subsampling.jpg"),
+        "jpeg: Horizontal Sub Sampling",
+    );
 }
 
 fn decode_v_samp(c: &mut Criterion) {
-    let data = read(
-        sample_path().join("test-images/jpeg/benchmarks/speed_bench_vertical_subsampling.jpg")
-    )
-    .unwrap();
-    let mut group = c.benchmark_group("jpeg: Vertical sub sampling");
-    group.throughput(Throughput::Bytes(data.len() as u64));
-
-    group.bench_function("zune-jpeg", |b| {
-        b.iter(|| black_box(decode_jpeg(data.as_slice())))
-    });
-
-    group.bench_function("mozjpeg", |b| {
-        b.iter(|| black_box(decode_jpeg_mozjpeg(data.as_slice())))
-    });
+    generic_bench(
+        c,
+        sample_path().join("test-images/jpeg/benchmarks/speed_bench_vertical_subsampling.jpg"),
+        "jpeg: Vertical sub sampling",
+    );
 }
 
 fn decode_hv_samp(c: &mut Criterion) {
-    let data =
-        read(sample_path().join("test-images/jpeg/benchmarks/speed_bench_hv_subsampling.jpg"))
-            .unwrap();
-    let mut group = c.benchmark_group("jpeg: HV sampling");
-    group.throughput(Throughput::Bytes(data.len() as u64));
-
-    group.bench_function("zune-jpeg", |b| {
-        b.iter(|| black_box(decode_jpeg(data.as_slice())))
-    });
-
-    group.bench_function("mozjpeg", |b| {
-        b.iter(|| black_box(decode_jpeg_mozjpeg(data.as_slice())))
-    });
+    generic_bench(
+        c,
+        sample_path().join("test-images/jpeg/benchmarks/speed_bench_hv_subsampling.jpg"),
+        "jpeg: HV sampling",
+    );
 }
 
 fn decode_jpeg_grayscale(buf: &[u8]) -> Vec<u8> {
@@ -158,65 +138,46 @@ fn criterion_benchmark_grayscale(c: &mut Criterion) {
 }
 
 fn decode_no_samp_prog(c: &mut Criterion) {
-    let a = sample_path().join("test-images/jpeg/benchmarks/speed_bench_prog.jpg");
-    let data = read(a).unwrap();
-    let mut group = c.benchmark_group("jpeg: No sampling Progressive decoding");
-
-    group.throughput(Throughput::Bytes(data.len() as u64));
-
-    group.bench_function("zune-jpeg", |b| {
-        b.iter(|| black_box(decode_jpeg(data.as_slice())))
-    });
-
-    group.bench_function("mozjpeg", |b| {
-        b.iter(|| black_box(decode_jpeg_mozjpeg(data.as_slice())))
-    });
+    generic_bench(
+        c,
+        sample_path().join("test-images/jpeg/benchmarks/speed_bench_prog.jpg"),
+        "jpeg: No sampling Progressive decoding",
+    );
 }
 
 fn decode_h_samp_prog(c: &mut Criterion) {
-    let x = read(sample_path().join("test-images/jpeg/benchmarks/speed_bench_prog_h_sampling.jpg"))
-        .unwrap();
-    let mut group = c.benchmark_group("jpeg: Progressive Horizontal Sub Sampling");
-    group.bench_function("zune-jpeg", |b| {
-        b.iter(|| black_box(decode_jpeg(x.as_slice())))
-    });
-
-    group.bench_function("mozjpeg", |b| {
-        b.iter(|| black_box(decode_jpeg_mozjpeg(x.as_slice())))
-    });
+    generic_bench(
+        c,
+        sample_path().join("test-images/jpeg/benchmarks/speed_bench_prog_h_sampling.jpg"),
+        "jpeg: Progressive Horizontal Sub Sampling",
+    )
 }
 
 fn decode_v_samp_prog(c: &mut Criterion) {
-    let x = read(sample_path().join("test-images/jpeg/benchmarks/speed_bench_prog_v_sampling.jpg"))
-        .unwrap();
-
-    let mut group = c.benchmark_group("jpeg: Progressive Vertical sub sampling");
-
-    group.bench_function("zune-jpeg", |b| {
-        b.iter(|| black_box(decode_jpeg(x.as_slice())))
-    });
-
-    group.bench_function("mozjpeg", |b| {
-        b.iter(|| black_box(decode_jpeg_mozjpeg(x.as_slice())))
-    });
+    generic_bench(
+        c,
+        sample_path().join("test-images/jpeg/benchmarks/speed_bench_prog_v_sampling.jpg"),
+        "jpeg: Progressive Vertical sub sampling",
+    )
 }
 
 fn decode_hv_samp_prog(c: &mut Criterion) {
-    let x =
-        read(sample_path().join("test-images/jpeg/benchmarks/speed_bench_prog_hv_sampling.jpg"))
-            .unwrap();
-    let mut group = c.benchmark_group("jpeg: Progressive HV sampling");
-    group.bench_function("zune-jpeg", |b| {
-        b.iter(|| black_box(decode_jpeg(x.as_slice())))
-    });
-
-    group.bench_function("mozjpeg", |b| {
-        b.iter(|| black_box(decode_jpeg_mozjpeg(x.as_slice())))
-    });
+    generic_bench(
+        c,
+        sample_path().join("test-images/jpeg/benchmarks/speed_bench_prog_hv_sampling.jpg"),
+        "jpeg: Progressive HV sampling",
+    )
 }
 
 fn decode_jpeg_opts(buf: &[u8], options: DecoderOptions) -> Vec<u8> {
     let mut d = JpegDecoder::new_with_options(ZCursor::new(buf), options);
+
+    d.decode().unwrap()
+}
+
+fn decode_jpeg_incremental_mode(buf: &[u8]) -> Vec<u8> {
+    let mut d = JpegDecoder::new(ZCursor::new(buf));
+    d.set_incremental_mode(true);
 
     d.decode().unwrap()
 }
@@ -243,6 +204,259 @@ fn decode_no_samp_opts(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Restart-marker / resumability path
+//
+// The benchmarks above all use JPEGs without restart markers (DRI), so the
+// per-RST checkpoint code added for incremental decoding is never exercised
+// by them. The benchmarks below close that gap with a DRI-bearing input
+// (four_components.jpg, restart interval = 7 MCUs, 4-component baseline).
+// They cover:
+//   * one-shot decode of a DRI image (steady-state RST checkpoint cost),
+//   * an incremental decode that triggers a recoverable-EOF retry, so the
+//     RST checkpoint capture + resume seek path is measured end-to-end.
+// ---------------------------------------------------------------------------
+
+use std::cell::Cell;
+use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::path::Path;
+use std::rc::Rc;
+
+/// Byte-slice cursor with an externally-adjustable visibility limit.
+///
+/// Reads/seeks beyond `limit` behave as if the data ended there (EOF). The
+/// bench grows `limit` via the shared `Rc<Cell<usize>>` to simulate more
+/// data arriving on the same decoder.
+struct GrowableCursor<'a> {
+    data: &'a [u8],
+    position: usize,
+    limit: Rc<Cell<usize>>,
+}
+
+impl<'a> GrowableCursor<'a> {
+    fn new(data: &'a [u8], limit: Rc<Cell<usize>>) -> Self {
+        Self {
+            data,
+            position: 0,
+            limit,
+        }
+    }
+
+    fn visible(&self) -> usize {
+        self.limit.get().min(self.data.len())
+    }
+}
+
+impl Read for GrowableCursor<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let visible = self.visible();
+        if self.position >= visible {
+            return Ok(0);
+        }
+        let available = &self.data[self.position..visible];
+        let n = available.len().min(buf.len());
+        buf[..n].copy_from_slice(&available[..n]);
+        self.position += n;
+        Ok(n)
+    }
+}
+
+impl BufRead for GrowableCursor<'_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        let visible = self.visible();
+        if self.position >= visible {
+            return Ok(&[]);
+        }
+        Ok(&self.data[self.position..visible])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.position += amt;
+    }
+}
+
+impl Seek for GrowableCursor<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(p) => p as i64,
+            SeekFrom::Current(p) => self.position as i64 + p,
+            SeekFrom::End(p) => self.visible() as i64 + p,
+        };
+        if new_pos < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.position = new_pos as usize;
+        Ok(self.position as u64)
+    }
+}
+
+/// One-shot decode of a DRI-bearing JPEG. Exercises the per-RST checkpoint
+/// capture code path on every restart-interval boundary in steady state.
+fn decode_restart_full(c: &mut Criterion) {
+    let data = read(sample_path().join("test-images/jpeg/four_components.jpg")).unwrap();
+    let mut group = c.benchmark_group("jpeg: DRI / Restart markers");
+    group.throughput(Throughput::Bytes(data.len() as u64));
+
+    group.bench_function("one-shot", |b| {
+        b.iter(|| black_box(decode_jpeg(data.as_slice())));
+    });
+}
+
+/// Incremental decode of a DRI-bearing JPEG that triggers a recoverable EOF
+/// and then resumes. The decoder is freshly constructed each iteration, so
+/// the measurement reflects: one full header parse, one truncated scan that
+/// returns ExhaustedData near the end, then a final scan that resumes from
+/// the latest RST checkpoint and finishes the decode.
+fn decode_restart_resume(c: &mut Criterion) {
+    let data = read(sample_path().join("test-images/jpeg/four_components.jpg")).unwrap();
+    let mut group = c.benchmark_group("jpeg: DRI / Restart markers");
+    group.throughput(Throughput::Bytes(data.len() as u64));
+
+    // Expose ~80% of the file on the first attempt so the scan loop hits
+    // recoverable EOF after several RST checkpoints have been recorded.
+    let partial = data.len() * 80 / 100;
+
+    group.bench_function("incremental resume", |b| {
+        b.iter(|| {
+            let limit = Rc::new(Cell::new(partial));
+            let cursor = GrowableCursor::new(data.as_slice(), Rc::clone(&limit));
+            let mut decoder = JpegDecoder::new(cursor);
+            decoder.decode_headers().expect("headers should fit in 80%");
+            let mut out = vec![0u8; decoder.output_buffer_size().unwrap()];
+
+            // First scan attempt: expect recoverable EOF.
+            match decoder.decode_into(&mut out) {
+                Ok(()) => panic!("scan should not complete at 80% visibility"),
+                Err(e) => assert!(e.is_recoverable_eof(), "got: {e:?}"),
+            }
+
+            // Expose remaining bytes and resume from the latest checkpoint.
+            limit.set(data.len());
+            decoder
+                .decode_into(&mut out)
+                .expect("scan should complete with full data");
+            black_box(out);
+        });
+    });
+}
+
+fn decode_streaming_mode(c: &mut Criterion) {
+    let data = read(sample_path().join("test-images/jpeg/benchmarks/speed_bench_hv_subsampling.jpg"))
+        .unwrap();
+    let mut group = c.benchmark_group("jpeg: Incremental mode checkpoints");
+    group.throughput(Throughput::Bytes(data.len() as u64));
+
+    group.bench_function("one-shot default", |b| {
+        b.iter(|| black_box(decode_jpeg(data.as_slice())));
+    });
+
+    group.bench_function("one-shot incremental-mode", |b| {
+        b.iter(|| black_box(decode_jpeg_incremental_mode(data.as_slice())));
+    });
+
+    let partial = data.len() * 80 / 100;
+
+    group.bench_function("first retry default", |b| {
+        b.iter(|| {
+            let limit = Rc::new(Cell::new(partial));
+            let cursor = GrowableCursor::new(data.as_slice(), Rc::clone(&limit));
+            let mut decoder = JpegDecoder::new(cursor);
+            decoder.decode_headers().expect("headers should fit in 80%");
+            let mut out = vec![0u8; decoder.output_buffer_size().unwrap()];
+
+            match decoder.decode_into(&mut out) {
+                Ok(()) => panic!("scan should not complete at 80% visibility"),
+                Err(e) => assert!(e.is_recoverable_eof(), "got: {e:?}"),
+            }
+
+            limit.set(data.len());
+            decoder
+                .decode_into(&mut out)
+                .expect("scan should complete with full data");
+            black_box(out);
+        });
+    });
+
+    group.bench_function("first retry incremental-mode", |b| {
+        b.iter(|| {
+            let limit = Rc::new(Cell::new(partial));
+            let cursor = GrowableCursor::new(data.as_slice(), Rc::clone(&limit));
+            let mut decoder = JpegDecoder::new(cursor);
+            decoder.set_incremental_mode(true);
+            decoder.decode_headers().expect("headers should fit in 80%");
+            let mut out = vec![0u8; decoder.output_buffer_size().unwrap()];
+
+            match decoder.decode_into(&mut out) {
+                Ok(()) => panic!("scan should not complete at 80% visibility"),
+                Err(e) => assert!(e.is_recoverable_eof(), "got: {e:?}"),
+            }
+
+            limit.set(data.len());
+            decoder
+                .decode_into(&mut out)
+                .expect("scan should complete with full data");
+            black_box(out);
+        });
+    });
+}
+
+fn decode_jpeg_raw_pull(buf: &[u8]) -> u64 {
+    let mut decoder = JpegDecoder::new(ZCursor::new(buf));
+    decoder.decode_headers().unwrap();
+    let mut raw = decoder.raw_output();
+    let layout = raw.layout().unwrap();
+    let count = raw.num_components().unwrap();
+    let strides: Vec<usize> = layout[..count]
+        .iter()
+        .map(|plane| plane.width + 13)
+        .collect();
+    let mut storage: Vec<Vec<u8>> = layout[..count]
+        .iter()
+        .enumerate()
+        .map(|(index, plane)| vec![0; strides[index] * plane.vertical_sampling_factor * 8])
+        .collect();
+    let mut checksum = 0_u64;
+
+    loop {
+        let mut planes: Vec<&mut [u8]> = storage.iter_mut().map(Vec::as_mut_slice).collect();
+        match raw.decode_next_imcu_row(&mut planes, &strides).unwrap() {
+            RawImcuRowStatus::RowReady { rows_written } => {
+                for index in 0..count {
+                    for row in 0..rows_written[index] {
+                        checksum = storage[index]
+                            [row * strides[index]..row * strides[index] + layout[index].width]
+                            .iter()
+                            .fold(checksum, |sum, byte| sum.wrapping_add(u64::from(*byte)));
+                    }
+                }
+            }
+            RawImcuRowStatus::Complete => break,
+            RawImcuRowStatus::NeedMoreInput => panic!("one-shot benchmark input suspended"),
+            _ => unreachable!(),
+        }
+    }
+    checksum
+}
+
+fn decode_raw_pull_output(c: &mut Criterion) {
+    let baseline =
+        read(sample_path().join("test-images/jpeg/benchmarks/speed_bench_hv_subsampling.jpg"))
+            .unwrap();
+    let progressive =
+        read(sample_path().join("test-images/jpeg/benchmarks/speed_bench_prog.jpg")).unwrap();
+    let mut group = c.benchmark_group("jpeg: raw iMCU-row output");
+
+    group.bench_function("baseline", |b| {
+        b.iter(|| black_box(decode_jpeg_raw_pull(baseline.as_slice())));
+    });
+    group.bench_function("progressive", |b| {
+        b.iter(|| black_box(decode_jpeg_raw_pull(progressive.as_slice())));
+    });
+}
+
 criterion_group!(name=benches;
       config={
       let c = Criterion::default();
@@ -251,6 +465,7 @@ criterion_group!(name=benches;
     targets=decode_no_samp,decode_h_samp,decode_v_samp,
     decode_hv_samp,criterion_benchmark_grayscale,
     decode_hv_samp_prog,decode_h_samp_prog,decode_no_samp_prog,decode_v_samp_prog,
-    decode_no_samp_opts);
+    decode_no_samp_opts,
+    decode_restart_full,decode_restart_resume,decode_streaming_mode,decode_raw_pull_output);
 
 criterion_main!(benches);

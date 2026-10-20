@@ -21,26 +21,36 @@ use crate::constants::{
     FASTCOPY_BYTES, FASTLOOP_MAX_BYTES_WRITTEN, HUFFDEC_END_OF_BLOCK, HUFFDEC_EXCEPTIONAL,
     HUFFDEC_LITERAL, HUFFDEC_SUITABLE_POINTER, LITLEN_DECODE_BITS, LITLEN_DECODE_RESULTS,
     LITLEN_ENOUGH, LITLEN_TABLE_BITS, OFFSET_DECODE_RESULTS, OFFSET_ENOUGH, OFFSET_TABLEBITS,
-    PRECODE_DECODE_RESULTS, PRECODE_ENOUGH, PRECODE_TABLE_BITS
+    PRECODE_DECODE_RESULTS, PRECODE_ENOUGH, PRECODE_TABLE_BITS,
 };
 use crate::errors::{DecodeErrorStatus, InflateDecodeErrors};
 #[cfg(feature = "gzip")]
 use crate::gzip_constants::{
     GZIP_CM_DEFLATE, GZIP_FCOMMENT, GZIP_FEXTRA, GZIP_FHCRC, GZIP_FNAME, GZIP_FOOTER_SIZE,
-    GZIP_FRESERVED, GZIP_ID1, GZIP_ID2
+    GZIP_FRESERVED, GZIP_ID1, GZIP_ID2,
 };
-use crate::utils::{copy_rep_matches, fixed_copy_within, make_decode_table_entry};
+use crate::utils::{
+    copy_rep_matches, copy_rep_matches_slow, fixed_copy_within, make_decode_table_entry,
+};
 
-struct DeflateHeaderTables {
-    litlen_decode_table: [u32; LITLEN_ENOUGH],
-    offset_decode_table: [u32; OFFSET_ENOUGH]
+pub(crate) struct DeflateHeaderTables {
+    pub(crate) litlen_decode_table: [u32; LITLEN_ENOUGH],
+    pub(crate) offset_decode_table: [u32; OFFSET_ENOUGH],
+    // temp tables, backed up here to support streaming decoding
+    pub(crate) precode_decode_table: [u32; PRECODE_ENOUGH],
+    pub(crate) precode_lens: [u8; DEFLATE_NUM_PRECODE_SYMS],
+    pub(crate) lens:
+        [u8; DEFLATE_NUM_LITLEN_SYMS + DEFLATE_NUM_OFFSET_SYMS + DELFATE_MAX_LENS_OVERRUN],
 }
 
 impl Default for DeflateHeaderTables {
     fn default() -> Self {
         DeflateHeaderTables {
             litlen_decode_table: [0; LITLEN_ENOUGH],
-            offset_decode_table: [0; OFFSET_ENOUGH]
+            offset_decode_table: [0; OFFSET_ENOUGH],
+            precode_decode_table: [0; PRECODE_ENOUGH],
+            precode_lens: [0; DEFLATE_NUM_PRECODE_SYMS],
+            lens: [0; DEFLATE_NUM_LITLEN_SYMS + DEFLATE_NUM_OFFSET_SYMS + DELFATE_MAX_LENS_OVERRUN],
         }
     }
 }
@@ -52,17 +62,17 @@ impl Default for DeflateHeaderTables {
 /// the deflate decoder.
 #[derive(Copy, Clone)]
 pub struct DeflateOptions {
-    limit:            usize,
+    limit: usize,
     confirm_checksum: bool,
-    size_hint:        usize
+    size_hint: usize,
 }
 
 impl Default for DeflateOptions {
     fn default() -> Self {
         DeflateOptions {
-            limit:            1 << 30,
+            limit: 1 << 30,
             confirm_checksum: true,
-            size_hint:        37000
+            size_hint: 37000,
         }
     }
 }
@@ -111,7 +121,7 @@ impl DeflateOptions {
     ///
     /// # Arguments
     /// - yes: When true, the decoder will confirm checksum
-    /// when false, the decoder will skip checksum verification
+    ///   when false, the decoder will skip checksum verification
     /// # Notes
     /// This does not have an influence for deflate decoding as
     /// it does not have a checksum
@@ -151,13 +161,13 @@ impl DeflateOptions {
 ///
 /// [options]: DeflateOptions
 pub struct DeflateDecoder<'a> {
-    data:                  &'a [u8],
-    position:              usize,
-    stream:                BitStreamReader<'a>,
-    is_last_block:         bool,
-    static_codes_loaded:   bool,
+    data: &'a [u8],
+    position: usize,
+    stream: BitStreamReader<'a>,
+    is_last_block: bool,
+    static_codes_loaded: bool,
     deflate_header_tables: DeflateHeaderTables,
-    options:               DeflateOptions
+    options: DeflateOptions,
 }
 
 impl<'a> DeflateDecoder<'a> {
@@ -166,7 +176,7 @@ impl<'a> DeflateDecoder<'a> {
     ///
     /// # Arguments
     /// - `data`: The compressed data. Data can be of any type
-    /// gzip,zlib or raw deflate.
+    ///   gzip,zlib or raw deflate.
     ///
     /// # Returns
     /// A decoder instance which will pull compressed data from `data` to inflate the output output
@@ -194,7 +204,7 @@ impl<'a> DeflateDecoder<'a> {
     ///
     /// # Arguments
     /// - `data`: The compressed data. Data can be of any format i.e
-    /// gzip, zlib or raw deflate.
+    ///   gzip, zlib or raw deflate.
     /// - `options` : A set of user defined options which tune how the decompressor
     ///
     ///  # Returns
@@ -217,11 +227,11 @@ impl<'a> DeflateDecoder<'a> {
         DeflateDecoder {
             data,
             position: 0,
-            stream: BitStreamReader::new(data),
+            stream: BitStreamReader::new(data, false),
             is_last_block: false,
             static_codes_loaded: false,
             deflate_header_tables: DeflateHeaderTables::default(),
-            options
+            options,
         }
     }
     /// Decode zlib-encoded data returning the uncompressed in a `Vec<u8>`
@@ -246,7 +256,7 @@ impl<'a> DeflateDecoder<'a> {
     /// This needs the `zlib` feature enabled to be available otherwise it's a
     /// compile time error
     ///
-    /// [InflateDecodeErrors]:crate::errors::InflateDecodeErrors
+    /// [InflateDecodeErrors]:InflateDecodeErrors
     ///
     #[cfg(feature = "zlib")]
     pub fn decode_zlib(&mut self) -> Result<Vec<u8>, InflateDecodeErrors> {
@@ -258,7 +268,7 @@ impl<'a> DeflateDecoder<'a> {
         /* Deflate */
         {
             return Err(InflateDecodeErrors::new_with_error(
-                DecodeErrorStatus::InsufficientData
+                DecodeErrorStatus::InsufficientData,
             ));
         }
 
@@ -283,21 +293,21 @@ impl<'a> DeflateDecoder<'a> {
                 )));
             }
             return Err(InflateDecodeErrors::new_with_error(
-                DecodeErrorStatus::GenericStr(format!("Unknown zlib compression method {cm}"))
+                DecodeErrorStatus::GenericStr(format!("Unknown zlib compression method {cm}")),
             ));
         }
         if cinfo > 7 {
             return Err(InflateDecodeErrors::new_with_error(
                 DecodeErrorStatus::GenericStr(format!(
                     "Unknown cinfo `{cinfo}` greater than 7, not allowed"
-                ))
+                )),
             ));
         }
         let flag_checks = (u16::from(cmf) * 256) + u16::from(flg);
 
         if flag_checks % 31 != 0 {
             return Err(InflateDecodeErrors::new_with_error(
-                DecodeErrorStatus::Generic("FCHECK integrity not preserved")
+                DecodeErrorStatus::Generic("FCHECK integrity not preserved"),
             ));
         }
 
@@ -355,32 +365,32 @@ impl<'a> DeflateDecoder<'a> {
     /// This needs the `gzip` feature enabled to be available, otherwise it's a
     /// compile time error
     ///
-    /// [InflateDecodeErrors]:crate::errors::InflateDecodeErrors
+    /// [InflateDecodeErrors]:InflateDecodeErrors
     ///
     #[cfg(feature = "gzip")]
     pub fn decode_gzip(&mut self) -> Result<Vec<u8>, InflateDecodeErrors> {
         if self.data.len() < 18 {
             return Err(InflateDecodeErrors::new_with_error(
-                DecodeErrorStatus::InsufficientData
+                DecodeErrorStatus::InsufficientData,
             ));
         }
 
         if self.data[self.position] != GZIP_ID1 {
             return Err(InflateDecodeErrors::new_with_error(
-                DecodeErrorStatus::CorruptData
+                DecodeErrorStatus::CorruptData,
             ));
         }
         self.position += 1;
         if self.data[self.position] != GZIP_ID2 {
             return Err(InflateDecodeErrors::new_with_error(
-                DecodeErrorStatus::CorruptData
+                DecodeErrorStatus::CorruptData,
             ));
         }
         self.position += 1;
 
         if self.data[self.position] != GZIP_CM_DEFLATE {
             return Err(InflateDecodeErrors::new_with_error(
-                DecodeErrorStatus::CorruptData
+                DecodeErrorStatus::CorruptData,
             ));
         }
         self.position += 1;
@@ -397,7 +407,7 @@ impl<'a> DeflateDecoder<'a> {
 
         if (flg & GZIP_FRESERVED) != 0 {
             return Err(InflateDecodeErrors::new_with_error(
-                DecodeErrorStatus::CorruptData
+                DecodeErrorStatus::CorruptData,
             ));
         }
         // extra field
@@ -411,7 +421,7 @@ impl<'a> DeflateDecoder<'a> {
 
             if self.data.len().saturating_sub(self.position) < xlen + GZIP_FOOTER_SIZE {
                 return Err(InflateDecodeErrors::new_with_error(
-                    DecodeErrorStatus::CorruptData
+                    DecodeErrorStatus::CorruptData,
                 ));
             }
             self.position += xlen;
@@ -427,7 +437,7 @@ impl<'a> DeflateDecoder<'a> {
                     }
                 } else {
                     return Err(InflateDecodeErrors::new_with_error(
-                        DecodeErrorStatus::InsufficientData
+                        DecodeErrorStatus::InsufficientData,
                     ));
                 }
             }
@@ -443,7 +453,7 @@ impl<'a> DeflateDecoder<'a> {
                     }
                 } else {
                     return Err(InflateDecodeErrors::new_with_error(
-                        DecodeErrorStatus::InsufficientData
+                        DecodeErrorStatus::InsufficientData,
                     ));
                 }
             }
@@ -455,7 +465,7 @@ impl<'a> DeflateDecoder<'a> {
 
         if self.position + GZIP_FOOTER_SIZE > self.data.len() {
             return Err(InflateDecodeErrors::new_with_error(
-                DecodeErrorStatus::InsufficientData
+                DecodeErrorStatus::InsufficientData,
             ));
         }
 
@@ -529,7 +539,7 @@ impl<'a> DeflateDecoder<'a> {
     /// let bytes = decoder.decode_deflate().unwrap();
     /// ```
     ///
-    ///  [InflateDecodeErrors]:crate::errors::InflateDecodeErrors
+    ///  [InflateDecodeErrors]:InflateDecodeErrors
     pub fn decode_deflate(&mut self) -> Result<Vec<u8>, InflateDecodeErrors> {
         self.start_deflate_block()
     }
@@ -539,15 +549,16 @@ impl<'a> DeflateDecoder<'a> {
     fn start_deflate_block(&mut self) -> Result<Vec<u8>, InflateDecodeErrors> {
         let mut out_block = vec![0; self.options.size_hint];
         self.start_deflate_block_inner(&mut out_block)?;
-        return Ok(out_block);
+        Ok(out_block)
     }
     #[allow(unused_assignments)]
+    #[allow(clippy::never_loop)]
     fn start_deflate_block_inner(
-        &mut self, out_block: &mut Vec<u8>
+        &mut self, out_block: &mut Vec<u8>,
     ) -> Result<(), InflateDecodeErrors> {
         // start deflate decode
         // re-read the stream so that we can remove code read by zlib
-        self.stream = BitStreamReader::new(&self.data[self.position..]);
+        self.stream = BitStreamReader::new(&self.data[self.position..], true);
 
         self.stream.refill();
 
@@ -604,9 +615,22 @@ impl<'a> DeflateDecoder<'a> {
 
                 let start = self.stream.get_position() + self.position + self.stream.over_read;
 
-                // ensure there is enough space for a fast copy
-                if dest_offset + len + FASTCOPY_BYTES > out_block.len() {
-                    // and if there is not, resize
+                // Enforce the limit against the projected output size, not the buffer
+                // length — growing to fit a stored block is not a limit violation (#94).
+                let projected = dest_offset.saturating_add(len);
+
+                if projected > self.options.limit {
+                    out_block.truncate(dest_offset);
+
+                    let err_msg =
+                        DecodeErrorStatus::OutputLimitExceeded(self.options.limit, projected);
+                    let error = InflateDecodeErrors::new(err_msg, out_block);
+
+                    return Err(error);
+                }
+
+                // resize the buffer if there isn't room for a fast copy
+                if projected + FASTCOPY_BYTES > out_block.len() {
                     let new_len = out_block.len() + RESIZE_BY + len;
 
                     out_block.resize(new_len, 0);
@@ -616,15 +640,6 @@ impl<'a> DeflateDecoder<'a> {
                     out_block.truncate(dest_offset);
 
                     let err_msg = DecodeErrorStatus::CorruptData;
-                    let error = InflateDecodeErrors::new(err_msg, out_block);
-
-                    return Err(error);
-                }
-                if dest_offset > self.options.limit {
-                    out_block.truncate(dest_offset);
-
-                    let err_msg =
-                        DecodeErrorStatus::OutputLimitExceeded(self.options.limit, out_block.len());
                     let error = InflateDecodeErrors::new(err_msg, out_block);
 
                     return Err(error);
@@ -689,7 +704,7 @@ impl<'a> DeflateDecoder<'a> {
                 let close_src = 3 * FASTCOPY_BYTES < self.stream.remaining_bytes();
 
                 if close_src {
-                    self.stream.refill_inner_loop();
+                    self.stream.refill();
 
                     let lit_mask = self.stream.peek_bits::<LITLEN_DECODE_BITS>();
 
@@ -715,7 +730,7 @@ impl<'a> DeflateDecoder<'a> {
                             break 'sequence;
                         }
 
-                        self.stream.refill_inner_loop();
+                        self.stream.refill();
                         /*
                          * Consume the bits for the litlen decode table entry.  Save the
                          * original bit-buf for later, in case the extra match length
@@ -875,7 +890,7 @@ impl<'a> DeflateDecoder<'a> {
                         src_offset = dest_offset - offset;
 
                         if self.stream.bits_left < 11 {
-                            self.stream.refill_inner_loop();
+                            self.stream.refill();
                         }
                         // Copy some bytes unconditionally
                         // This makes us copy smaller match lengths quicker because we don't need
@@ -914,7 +929,7 @@ impl<'a> DeflateDecoder<'a> {
                                 fixed_copy_within::<FASTCOPY_BYTES>(
                                     out_block,
                                     src_position,
-                                    dest_position
+                                    dest_position,
                                 );
 
                                 src_position += offset;
@@ -950,7 +965,7 @@ impl<'a> DeflateDecoder<'a> {
                                 fixed_copy_within::<FASTCOPY_BYTES>(
                                     out_block,
                                     dest_src_offset,
-                                    current_position
+                                    current_position,
                                 );
 
                                 dest_src_offset += FASTCOPY_BYTES;
@@ -967,7 +982,7 @@ impl<'a> DeflateDecoder<'a> {
 
                             let err_msg = DecodeErrorStatus::OutputLimitExceeded(
                                 self.options.limit,
-                                dest_offset
+                                dest_offset,
                             );
                             let error = InflateDecodeErrors::new(err_msg, out_block);
 
@@ -1146,10 +1161,10 @@ impl<'a> DeflateDecoder<'a> {
                 return Err(DecodeErrorStatus::InsufficientData);
             }
 
-            num_litlen_syms = 257 + (self.stream.get_bits(5)) as usize;
-            num_offset_syms = 1 + (self.stream.get_bits(5)) as usize;
+            num_litlen_syms = 257 + self.stream.get_bits(5) as usize;
+            num_offset_syms = 1 + self.stream.get_bits(5) as usize;
 
-            let num_explicit_precode_lens = 4 + (self.stream.get_bits(4)) as usize;
+            let num_explicit_precode_lens = 4 + self.stream.get_bits(4) as usize;
 
             self.stream.refill();
 
@@ -1177,13 +1192,13 @@ impl<'a> DeflateDecoder<'a> {
                 precode_lens[usize::from(*i)] = bits;
             }
 
-            self.build_decode_table_inner(
+            build_decode_table_inner(
                 &precode_lens,
                 &PRECODE_DECODE_RESULTS,
                 &mut precode_decode_table,
                 PRECODE_TABLE_BITS,
                 DEFLATE_NUM_PRECODE_SYMS,
-                DEFLATE_MAX_CODEWORD_LENGTH
+                DEFLATE_MAX_CODEWORD_LENGTH,
             )?;
 
             /* Decode the litlen and offset codeword lengths. */
@@ -1296,22 +1311,22 @@ impl<'a> DeflateDecoder<'a> {
             num_offset_syms = 32;
         }
         // build offset decode table
-        self.build_decode_table_inner(
+        build_decode_table_inner(
             &lens[num_litlen_syms..],
             &OFFSET_DECODE_RESULTS,
             &mut offset_decode_table,
             OFFSET_TABLEBITS,
             num_offset_syms,
-            DEFLATE_MAX_OFFSET_CODEWORD_LENGTH
+            DEFLATE_MAX_OFFSET_CODEWORD_LENGTH,
         )?;
 
-        self.build_decode_table_inner(
+        build_decode_table_inner(
             &lens,
             &LITLEN_DECODE_RESULTS,
             &mut litlen_decode_table,
             LITLEN_TABLE_BITS,
             num_litlen_syms,
-            DEFLATE_MAX_LITLEN_CODEWORD_LENGTH
+            DEFLATE_MAX_LITLEN_CODEWORD_LENGTH,
         )?;
 
         self.deflate_header_tables.offset_decode_table = offset_decode_table;
@@ -1319,313 +1334,309 @@ impl<'a> DeflateDecoder<'a> {
 
         Ok(())
     }
-    /// Build the decode table for the precode
-    #[allow(clippy::needless_range_loop)]
-    fn build_decode_table_inner(
-        &mut self, lens: &[u8], decode_results: &[u32], decode_table: &mut [u32],
-        table_bits: usize, num_syms: usize, mut max_codeword_len: usize
-    ) -> Result<(), DecodeErrorStatus> {
-        const BITS: u32 = usize::BITS - 1;
+}
 
-        let mut len_counts: [u32; DEFLATE_MAX_CODEWORD_LENGTH + 1] =
-            [0; DEFLATE_MAX_CODEWORD_LENGTH + 1];
-        let mut offsets: [u32; DEFLATE_MAX_CODEWORD_LENGTH + 1] =
-            [0; DEFLATE_MAX_CODEWORD_LENGTH + 1];
-        let mut sorted_syms: [u16; DEFLATE_MAX_NUM_SYMS] = [0; DEFLATE_MAX_NUM_SYMS];
+/// Build the decode table for the precode
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn build_decode_table_inner(
+    lens: &[u8], decode_results: &[u32], decode_table: &mut [u32], table_bits: usize,
+    num_syms: usize, mut max_codeword_len: usize,
+) -> Result<(), DecodeErrorStatus> {
+    const BITS: u32 = usize::BITS - 1;
 
-        let mut i;
+    let mut len_counts: [u32; DEFLATE_MAX_CODEWORD_LENGTH + 1] =
+        [0; DEFLATE_MAX_CODEWORD_LENGTH + 1];
+    let mut offsets: [u32; DEFLATE_MAX_CODEWORD_LENGTH + 1] = [0; DEFLATE_MAX_CODEWORD_LENGTH + 1];
+    let mut sorted_syms: [u16; DEFLATE_MAX_NUM_SYMS] = [0; DEFLATE_MAX_NUM_SYMS];
 
-        // count how many codewords have each length, including 0.
-        for sym in 0..num_syms {
-            len_counts[usize::from(lens[sym])] += 1;
-        }
+    let mut i;
 
-        /*
-         * Determine the actual maximum codeword length that was used, and
-         * decrease table_bits to it if allowed.
-         */
-        while max_codeword_len > 1 && len_counts[max_codeword_len] == 0 {
-            max_codeword_len -= 1;
-        }
-        /*
-         * Sort the symbols primarily by increasing codeword length and
-         *	A temporary array of length @num_syms.
-         * secondarily by increasing symbol value; or equivalently by their
-         * codewords in lexicographic order, since a canonical code is assumed.
-         *
-         * For efficiency, also compute 'codespace_used' in the same pass over
-         * 'len_counts[]' used to build 'offsets[]' for sorting.
-         */
-        offsets[0] = 0;
-        offsets[1] = len_counts[0];
+    // count how many codewords have each length, including 0.
+    for sym in 0..num_syms {
+        len_counts[usize::from(lens[sym])] += 1;
+    }
 
-        let mut codespace_used = 0_u32;
+    /*
+     * Determine the actual maximum codeword length that was used, and
+     * decrease table_bits to it if allowed.
+     */
+    while max_codeword_len > 1 && len_counts[max_codeword_len] == 0 {
+        max_codeword_len -= 1;
+    }
+    /*
+     * Sort the symbols primarily by increasing codeword length and
+     *	A temporary array of length @num_syms.
+     * secondarily by increasing symbol value; or equivalently by their
+     * codewords in lexicographic order, since a canonical code is assumed.
+     *
+     * For efficiency, also compute 'codespace_used' in the same pass over
+     * 'len_counts[]' used to build 'offsets[]' for sorting.
+     */
+    offsets[0] = 0;
+    offsets[1] = len_counts[0];
 
-        for len in 1..max_codeword_len {
-            offsets[len + 1] = offsets[len] + len_counts[len];
-            codespace_used = (codespace_used << 1) + len_counts[len];
-        }
-        codespace_used = (codespace_used << 1) + len_counts[max_codeword_len];
+    let mut codespace_used = 0_u32;
 
-        for sym in 0..num_syms {
-            let pos = usize::from(lens[sym]);
-            sorted_syms[offsets[pos] as usize] = sym as u16;
-            offsets[pos] += 1;
-        }
-        i = (offsets[0]) as usize;
+    for len in 1..max_codeword_len {
+        offsets[len + 1] = offsets[len] + len_counts[len];
+        codespace_used = (codespace_used << 1) + len_counts[len];
+    }
+    codespace_used = (codespace_used << 1) + len_counts[max_codeword_len];
 
-        /*
-         * Check whether the lengths form a complete code (exactly fills the
-         * codespace), an incomplete code (doesn't fill the codespace), or an
-         * overfull code (overflows the codespace).  A codeword of length 'n'
-         * uses proportion '1/(2^n)' of the codespace.  An overfull code is
-         * nonsensical, so is considered invalid.  An incomplete code is
-         * considered valid only in two specific cases; see below.
-         */
+    for sym in 0..num_syms {
+        let pos = usize::from(lens[sym]);
+        sorted_syms[offsets[pos] as usize] = sym as u16;
+        offsets[pos] += 1;
+    }
+    i = offsets[0] as usize;
 
-        // Overfull code
-        if codespace_used > 1 << max_codeword_len {
-            return Err(DecodeErrorStatus::Generic("Overflown code"));
-        }
-        // incomplete code
-        if codespace_used < 1 << max_codeword_len {
-            let entry = if codespace_used == 0 {
-                /*
-                 * An empty code is allowed.  This can happen for the
-                 * offset code in DEFLATE, since a dynamic Huffman block
-                 * need not contain any matches.
-                 */
+    /*
+     * Check whether the lengths form a complete code (exactly fills the
+     * codespace), an incomplete code (doesn't fill the codespace), or an
+     * overfull code (overflows the codespace).  A codeword of length 'n'
+     * uses proportion '1/(2^n)' of the codespace.  An overfull code is
+     * nonsensical, so is considered invalid.  An incomplete code is
+     * considered valid only in two specific cases; see below.
+     */
 
-                /* sym=0, len=1 (arbitrary) */
-                make_decode_table_entry(decode_results, 0, 1)
-            } else {
-                /*
-                 * Allow codes with a single used symbol, with codeword
-                 * length 1.  The DEFLATE RFC is unclear regarding this
-                 * case.  What zlib's decompressor does is permit this
-                 * for the litlen and offset codes and assume the
-                 * codeword is '0' rather than '1'.  We do the same
-                 * except we allow this for precodes too, since there's
-                 * no convincing reason to treat the codes differently.
-                 * We also assign both codewords '0' and '1' to the
-                 * symbol to avoid having to handle '1' specially.
-                 */
-                if codespace_used != 1 << (max_codeword_len - 1) || len_counts[1] != 1 {
-                    return Err(DecodeErrorStatus::Generic(
-                        "Cannot work with empty pre-code table"
-                    ));
-                }
-                make_decode_table_entry(decode_results, usize::from(sorted_syms[i]), 1)
-            };
+    // Overfull code
+    if codespace_used > 1 << max_codeword_len {
+        return Err(DecodeErrorStatus::Generic("Overflown code"));
+    }
+    // incomplete code
+    if codespace_used < 1 << max_codeword_len {
+        let entry = if codespace_used == 0 {
             /*
-             * Note: the decode table still must be fully initialized, in
-             * case the stream is malformed and contains bits from the part
-             * of the codespace the incomplete code doesn't use.
+             * An empty code is allowed.  This can happen for the
+             * offset code in DEFLATE, since a dynamic Huffman block
+             * need not contain any matches.
              */
-            decode_table.fill(entry);
-            return Ok(());
-        }
 
+            /* sym=0, len=1 (arbitrary) */
+            make_decode_table_entry(decode_results, 0, 1)
+        } else {
+            /*
+             * Allow codes with a single used symbol, with codeword
+             * length 1.  The DEFLATE RFC is unclear regarding this
+             * case.  What zlib's decompressor does is permit this
+             * for the litlen and offset codes and assume the
+             * codeword is '0' rather than '1'.  We do the same
+             * except we allow this for precodes too, since there's
+             * no convincing reason to treat the codes differently.
+             * We also assign both codewords '0' and '1' to the
+             * symbol to avoid having to handle '1' specially.
+             */
+            if codespace_used != 1 << (max_codeword_len - 1) || len_counts[1] != 1 {
+                return Err(DecodeErrorStatus::Generic(
+                    "Cannot work with empty pre-code table",
+                ));
+            }
+            make_decode_table_entry(decode_results, usize::from(sorted_syms[i]), 1)
+        };
         /*
-         * The lengths form a complete code.  Now, enumerate the codewords in
-         * lexicographic order and fill the decode table entries for each one.
-         *
-         * First, process all codewords with len <= table_bits.  Each one gets
-         * '2^(table_bits-len)' direct entries in the table.
-         *
-         * Since DEFLATE uses bit-reversed codewords, these entries aren't
-         * consecutive but rather are spaced '2^len' entries apart.  This makes
-         * filling them naively somewhat awkward and inefficient, since strided
-         * stores are less cache-friendly and preclude the use of word or
-         * vector-at-a-time stores to fill multiple entries per instruction.
-         *
-         * To optimize this, we incrementally double the table size.  When
-         * processing codewords with length 'len', the table is treated as
-         * having only '2^len' entries, so each codeword uses just one entry.
-         * Then, each time 'len' is incremented, the table size is doubled and
-         * the first half is copied to the second half.  This significantly
-         * improves performance over naively doing strided stores.
-         *
-         * Note that some entries copied for each table doubling may not have
-         * been initialized yet, but it doesn't matter since they're guaranteed
-         * to be initialized later (because the Huffman code is complete).
+         * Note: the decode table still must be fully initialized, in
+         * case the stream is malformed and contains bits from the part
+         * of the codespace the incomplete code doesn't use.
          */
-        let mut codeword = 0;
-        let mut len = 1;
-        let mut count = len_counts[1];
+        decode_table.fill(entry);
+        return Ok(());
+    }
 
-        while count == 0 {
-            len += 1;
+    /*
+     * The lengths form a complete code.  Now, enumerate the codewords in
+     * lexicographic order and fill the decode table entries for each one.
+     *
+     * First, process all codewords with len <= table_bits.  Each one gets
+     * '2^(table_bits-len)' direct entries in the table.
+     *
+     * Since DEFLATE uses bit-reversed codewords, these entries aren't
+     * consecutive but rather are spaced '2^len' entries apart.  This makes
+     * filling them naively somewhat awkward and inefficient, since strided
+     * stores are less cache-friendly and preclude the use of word or
+     * vector-at-a-time stores to fill multiple entries per instruction.
+     *
+     * To optimize this, we incrementally double the table size.  When
+     * processing codewords with length 'len', the table is treated as
+     * having only '2^len' entries, so each codeword uses just one entry.
+     * Then, each time 'len' is incremented, the table size is doubled and
+     * the first half is copied to the second half.  This significantly
+     * improves performance over naively doing strided stores.
+     *
+     * Note that some entries copied for each table doubling may not have
+     * been initialized yet, but it doesn't matter since they're guaranteed
+     * to be initialized later (because the Huffman code is complete).
+     */
+    let mut codeword = 0;
+    let mut len = 1;
+    let mut count = len_counts[1];
 
-            if len >= len_counts.len() {
-                break;
-            }
-            count = len_counts[len];
+    while count == 0 {
+        len += 1;
+
+        if len >= len_counts.len() {
+            break;
         }
+        count = len_counts[len];
+    }
 
-        let mut curr_table_end = 1 << len;
+    let mut curr_table_end = 1 << len;
 
-        while len <= table_bits {
-            // Process all count codewords with length len
-            loop {
-                let entry = make_decode_table_entry(
-                    decode_results,
-                    usize::from(sorted_syms[i]),
-                    len as u32
-                );
-                i += 1;
-                // fill first entry for current codeword
-                decode_table[codeword] = entry;
+    while len <= table_bits {
+        // Process all count codewords with length len
+        loop {
+            let entry =
+                make_decode_table_entry(decode_results, usize::from(sorted_syms[i]), len as u32);
+            i += 1;
+            // fill first entry for current codeword
+            decode_table[codeword] = entry;
 
-                if codeword == curr_table_end - 1 {
-                    // last codeword (all 1's)
-                    for _ in len..table_bits {
-                        decode_table.copy_within(0..curr_table_end, curr_table_end);
-
-                        curr_table_end <<= 1;
-                    }
-                    return Ok(());
-                }
-                /*
-                 * To advance to the lexicographically next codeword in
-                 * the canonical code, the codeword must be incremented,
-                 * then 0's must be appended to the codeword as needed
-                 * to match the next codeword's length.
-                 *
-                 * Since the codeword is bit-reversed, appending 0's is
-                 * a no-op.  However, incrementing it is nontrivial.  To
-                 * do so efficiently, use the 'bsr' instruction to find
-                 * the last (highest order) 0 bit in the codeword, set
-                 * it, and clear any later (higher order) 1 bits.  But
-                 * 'bsr' actually finds the highest order 1 bit, so to
-                 * use it first flip all bits in the codeword by XOR' ing
-                 * it with (1U << len) - 1 == cur_table_end - 1.
-                 */
-
-                let adv = BITS - (codeword ^ (curr_table_end - 1)).leading_zeros();
-                let bit = 1 << adv;
-
-                codeword &= bit - 1;
-                codeword |= bit;
-                count -= 1;
-
-                if count == 0 {
-                    break;
-                }
-            }
-            // advance to the next codeword length
-            loop {
-                len += 1;
-
-                if len <= table_bits {
-                    // dest is decode_table[curr_table_end]
-                    // source is decode_table(start of table);
-                    // size is curr_table;
-
+            if codeword == curr_table_end - 1 {
+                // last codeword (all 1's)
+                for _ in len..table_bits {
                     decode_table.copy_within(0..curr_table_end, curr_table_end);
 
-                    //decode_table.copy_within(range, curr_table_end);
                     curr_table_end <<= 1;
                 }
-                count = len_counts[len];
-
-                if count != 0 {
-                    break;
-                }
-            }
-        }
-        // process codewords with len > table_bits.
-        // Require sub-tables
-        curr_table_end = 1 << table_bits;
-
-        let mut subtable_prefix = usize::MAX;
-        let mut subtable_start = 0;
-        let mut subtable_bits;
-
-        loop {
-            /*
-             * Start a new sub-table if the first 'table_bits' bits of the
-             * codeword don't match the prefix of the current subtable.
-             */
-            if codeword & ((1_usize << table_bits) - 1) != subtable_prefix {
-                subtable_prefix = codeword & ((1 << table_bits) - 1);
-                subtable_start = curr_table_end;
-
-                /*
-                 * Calculate the subtable length.  If the codeword has
-                 * length 'table_bits + n', then the subtable needs
-                 * '2^n' entries.  But it may need more; if fewer than
-                 * '2^n' codewords of length 'table_bits + n' remain,
-                 * then the length will need to be incremented to bring
-                 * in longer codewords until the subtable can be
-                 * completely filled.  Note that because the Huffman
-                 * code is complete, it will always be possible to fill
-                 * the sub-table eventually.
-                 */
-                subtable_bits = len - table_bits;
-                codespace_used = count;
-
-                while codespace_used < (1 << subtable_bits) {
-                    subtable_bits += 1;
-
-                    if subtable_bits + table_bits > 15 {
-                        return Err(DecodeErrorStatus::CorruptData);
-                    }
-
-                    codespace_used = (codespace_used << 1) + len_counts[table_bits + subtable_bits];
-                }
-
-                /*
-                 * Create the entry that points from the main table to
-                 * the subtable.
-                 */
-                decode_table[subtable_prefix] = (subtable_start as u32) << 16
-                    | HUFFDEC_EXCEPTIONAL
-                    | HUFFDEC_SUITABLE_POINTER
-                    | (subtable_bits as u32) << 8
-                    | table_bits as u32;
-
-                curr_table_end = subtable_start + (1 << subtable_bits);
-            }
-
-            /* Fill the sub-table entries for the current codeword. */
-
-            let stride = 1 << (len - table_bits);
-
-            let mut j = subtable_start + (codeword >> table_bits);
-
-            let entry = make_decode_table_entry(
-                decode_results,
-                sorted_syms[i] as usize,
-                (len - table_bits) as u32
-            );
-            i += 1;
-
-            while j < curr_table_end {
-                decode_table[j] = entry;
-                j += stride;
-            }
-            //advance to the next codeword
-            if codeword == (1 << len) - 1 {
-                // last codeword
                 return Ok(());
             }
+            /*
+             * To advance to the lexicographically next codeword in
+             * the canonical code, the codeword must be incremented,
+             * then 0's must be appended to the codeword as needed
+             * to match the next codeword's length.
+             *
+             * Since the codeword is bit-reversed, appending 0's is
+             * a no-op.  However, incrementing it is nontrivial.  To
+             * do so efficiently, use the 'bsr' instruction to find
+             * the last (highest order) 0 bit in the codeword, set
+             * it, and clear any later (higher order) 1 bits.  But
+             * 'bsr' actually finds the highest order 1 bit, so to
+             * use it first flip all bits in the codeword by XOR' ing
+             * it with (1U << len) - 1 == cur_table_end - 1.
+             */
 
-            let adv = BITS - (codeword ^ ((1 << len) - 1)).leading_zeros();
+            let adv = BITS - (codeword ^ (curr_table_end - 1)).leading_zeros();
             let bit = 1 << adv;
 
             codeword &= bit - 1;
             codeword |= bit;
             count -= 1;
 
-            while count == 0 {
-                len += 1;
-                count = len_counts[len];
+            if count == 0 {
+                break;
+            }
+        }
+        // advance to the next codeword length
+        loop {
+            len += 1;
+
+            if len <= table_bits {
+                // dest is decode_table[curr_table_end]
+                // source is decode_table(start of table);
+                // size is curr_table;
+
+                decode_table.copy_within(0..curr_table_end, curr_table_end);
+
+                //decode_table.copy_within(range, curr_table_end);
+                curr_table_end <<= 1;
+            }
+            count = len_counts[len];
+
+            if count != 0 {
+                break;
             }
         }
     }
-}
+    // process codewords with len > table_bits.
+    // Require sub-tables
+    curr_table_end = 1 << table_bits;
 
+    let mut subtable_prefix = usize::MAX;
+    let mut subtable_start = 0;
+    let mut subtable_bits;
+
+    loop {
+        /*
+         * Start a new sub-table if the first 'table_bits' bits of the
+         * codeword don't match the prefix of the current subtable.
+         */
+        if codeword & ((1_usize << table_bits) - 1) != subtable_prefix {
+            subtable_prefix = codeword & ((1 << table_bits) - 1);
+            subtable_start = curr_table_end;
+
+            /*
+             * Calculate the subtable length.  If the codeword has
+             * length 'table_bits + n', then the subtable needs
+             * '2^n' entries.  But it may need more; if fewer than
+             * '2^n' codewords of length 'table_bits + n' remain,
+             * then the length will need to be incremented to bring
+             * in longer codewords until the subtable can be
+             * completely filled.  Note that because the Huffman
+             * code is complete, it will always be possible to fill
+             * the sub-table eventually.
+             */
+            subtable_bits = len - table_bits;
+            codespace_used = count;
+
+            while codespace_used < (1 << subtable_bits) {
+                subtable_bits += 1;
+
+                if subtable_bits + table_bits > 15 {
+                    return Err(DecodeErrorStatus::CorruptData);
+                }
+
+                codespace_used = (codespace_used << 1) + len_counts[table_bits + subtable_bits];
+            }
+
+            /*
+             * Create the entry that points from the main table to
+             * the subtable.
+             */
+            decode_table[subtable_prefix] = (subtable_start as u32) << 16
+                | HUFFDEC_EXCEPTIONAL
+                | HUFFDEC_SUITABLE_POINTER
+                | (subtable_bits as u32) << 8
+                | table_bits as u32;
+
+            curr_table_end = subtable_start + (1 << subtable_bits);
+        }
+
+        /* Fill the sub-table entries for the current codeword. */
+
+        let stride = 1 << (len - table_bits);
+
+        let mut j = subtable_start + (codeword >> table_bits);
+
+        let entry = make_decode_table_entry(
+            decode_results,
+            sorted_syms[i] as usize,
+            (len - table_bits) as u32,
+        );
+        i += 1;
+
+        while j < curr_table_end {
+            decode_table[j] = entry;
+            j += stride;
+        }
+        //advance to the next codeword
+        if codeword == (1 << len) - 1 {
+            // last codeword
+            return Ok(());
+        }
+
+        let adv = BITS - (codeword ^ ((1 << len) - 1)).leading_zeros();
+        let bit = 1 << adv;
+
+        codeword &= bit - 1;
+        codeword |= bit;
+        count -= 1;
+
+        while count == 0 {
+            len += 1;
+            count = len_counts[len];
+        }
+    }
+}
 const RESIZE_BY: usize = 1024 * 4; // 4 kb
 
 /// Resize vector if its current space wont

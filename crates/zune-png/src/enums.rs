@@ -8,7 +8,7 @@
 #![allow(clippy::upper_case_acronyms, non_camel_case_types)]
 
 /// Chunk type according to table 5.3 of
-/// the jpeg spec, see https://www.w3.org/TR/2003/REC-PNG-20031110/
+/// the PNG spec, see https://www.w3.org/TR/2003/REC-PNG-20031110/
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum PngChunkType {
     IHDR,
@@ -19,7 +19,7 @@ pub enum PngChunkType {
     cHRM,
     gAMA,
     iCCP,
-    sBit,
+    sBIT,
     sRGB,
     bKGD,
     hIST,
@@ -33,6 +33,8 @@ pub enum PngChunkType {
     fcTL,
     acTL,
     fdAT,
+    cICP,
+    cLLI,
     unkn
 }
 
@@ -42,7 +44,7 @@ impl PngChunkType {
     pub const fn should_appear_before_ptle(self) -> bool {
         matches!(
             self,
-            Self::cHRM | Self::gAMA | Self::iCCP | Self::sBit | Self::sRGB
+            Self::cHRM | Self::gAMA | Self::iCCP | Self::sBIT | Self::sRGB
         )
     }
     /// Return true if a chunk should appear
@@ -60,7 +62,7 @@ impl PngChunkType {
                 | Self::cHRM
                 | Self::gAMA
                 | Self::iCCP
-                | Self::sBit
+                | Self::sBIT
                 | Self::sRGB
                 | Self::bKGD
                 | Self::hIST
@@ -119,20 +121,17 @@ impl Default for FilterMethod {
 /// Default is `Unknown` but should change it to
 /// the image interlace when headers are decoded
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Default)]
 pub enum InterlaceMethod {
     /// Standard/ No interlacing
     Standard,
     /// Adam7 interlacing
     Adam7,
     /// The interlacing of the image is currently unknown
+    #[default]
     Unknown
 }
 
-impl Default for InterlaceMethod {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
 
 impl InterlaceMethod {
     pub fn from_int(int: u8) -> Option<InterlaceMethod> {
@@ -145,20 +144,17 @@ impl InterlaceMethod {
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Default)]
 pub enum PngColor {
     Luma,
     Palette,
     LumaA,
     RGB,
     RGBA,
+    #[default]
     Unknown
 }
 
-impl Default for PngColor {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
 
 impl PngColor {
     pub(crate) fn num_components(self) -> u8 {

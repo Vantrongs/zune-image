@@ -113,7 +113,7 @@ pub extern "C" fn zil_zimg_write_to_output(
 
     let result = match image.depth() {
         BitDepth::Eight => zune_image::utils::swizzle_channels(channels, output_array)
-            .map_err(|e| ImageErrors::ChannelErrors(e)),
+            .map_err(ImageErrors::ChannelErrors),
         BitDepth::Sixteen => {
             let (a, b, c) = unsafe { output_array.align_to_mut::<u16>() };
 
@@ -121,7 +121,7 @@ pub extern "C" fn zil_zimg_write_to_output(
                 Err(ImageErrors::GenericStr("Unaligned output"))
             } else {
                 zune_image::utils::swizzle_channels(channels, b)
-                    .map_err(|e| ImageErrors::ChannelErrors(e))
+                    .map_err(ImageErrors::ChannelErrors)
             }
         }
         BitDepth::Float32 => {
@@ -131,7 +131,7 @@ pub extern "C" fn zil_zimg_write_to_output(
                 Err(ImageErrors::GenericStr("Unaligned output"))
             } else {
                 zune_image::utils::swizzle_channels(channels, b)
-                    .map_err(|e| ImageErrors::ChannelErrors(e))
+                    .map_err(ImageErrors::ChannelErrors)
             }
         }
         _ => Err(ImageErrors::GenericStr("Unknown depth"))
@@ -157,7 +157,7 @@ pub extern "C" fn zil_zimg_write_to_output(
 #[no_mangle]
 pub extern "C" fn zil_zimg_new() -> *mut ZImage {
     let ptr = unsafe { libc::malloc(std::mem::size_of::<ZImage>()) }.cast();
-    unsafe { *ptr = ZImage::new(vec![], BitDepth::Unknown, 1, 1, ColorSpace::Unknown) };
+    unsafe { *ptr = ZImage::new(vec![], BitDepth::Unknown, 0, 0, ColorSpace::Unknown) };
     ptr
 }
 /// Free an image

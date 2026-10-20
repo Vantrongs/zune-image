@@ -6,107 +6,142 @@
 
 //! Utilities required by multiple implementations
 //! that help to do small things
-use zune_core::bit_depth::{BitDepth, ByteEndian};
+use zune_core::bit_depth::BitDepth;
 
 use crate::decoder::PLTEEntry;
 use crate::enums::PngColor;
 
-mod avx;
-mod sse;
-
-/// scalar impl of big-endian to native endian
-fn convert_be_to_ne_scalar(out: &mut [u8]) {
-    out.chunks_exact_mut(2).for_each(|chunk| {
-        let value: [u8; 2] = chunk.try_into().unwrap();
-        let pix = u16::from_be_bytes(value);
-        chunk.copy_from_slice(&pix.to_ne_bytes());
-    });
-}
-
-/// Convert big endian to little endian for u16 samples
-///
-/// This is a no-op if the system is already in big-endian
-///
-/// # Arguments
-///
-/// * `out`:  The output array for which we will convert in place
-/// * `use_sse4`:  Whether to use SSE intrinsics for conversion
-///
-fn convert_be_to_le_u16(out: &mut [u8], _use_sse4: bool) {
-    #[cfg(feature = "std")]
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if _use_sse4 && is_x86_feature_detected!("avx2") {
-            unsafe {
-                return avx::convert_be_to_ne_avx(out);
-            };
-        }
-        if _use_sse4 && is_x86_feature_detected!("ssse3") {
-            unsafe {
-                return sse::convert_be_to_ne_sse4(out);
-            }
-        }
-    }
-    convert_be_to_ne_scalar(out)
-}
-
-/// Convert u16 big endian samples to target endian
-///
-/// # Arguments
-///
-/// * `sample`:  The raw samples assumed to be in big endian
-/// * `endian`:  The target endianness for which to convert samples
-/// * `use_intrinsics`:  Whether to use sse intrinsics to speed up
-///
-///
-/// sample array is modified in place
-///
-#[inline]
-pub fn convert_be_to_target_endian_u16(
-    sample: &mut [u8], endian: ByteEndian, use_intrinsics: bool
-) {
-    // if target is BE no conversion
-    if endian == ByteEndian::BE {
-        return;
-    }
-    // if system is BE, no conversion
-    // poor man's check
-    if u16::from_be_bytes([234, 231]) == u16::from_ne_bytes([234, 231]) {
-        return;
-    }
-    // convert then
-    convert_be_to_le_u16(sample, use_intrinsics);
-}
-
 /// Return true if the system is little endian
 pub const fn is_le() -> bool {
     // see if le and be conversion return the same number
-    u16::from_le_bytes([234, 231]) == u16::from_ne_bytes([234, 231])
+    cfg!(target_endian = "little")
 }
 
 pub(crate) fn expand_palette(
-    input: &[u8], out: &mut [u8], palette: &[PLTEEntry; 256], components: usize
+    mut input: &[u8], mut out: &mut [u8], palette: &[PLTEEntry; 256], components: usize,
 ) {
-    if components == 0 {
-        return;
-    }
-
     if components == 3 {
-        for (in_px, px) in input.iter().zip(out.chunks_exact_mut(3)) {
-            let entry = palette[usize::from(*in_px) % 256];
+        // From image-rs/png
+        while out.len() >= 4 && !input.is_empty() {
+            // Copying 4 bytes at a time is more efficient than 3.
+            let rgba = &palette[input[0] as usize].0;
+            out[0..4].copy_from_slice(rgba);
 
-            px[0] = entry.red;
-            px[1] = entry.green;
-            px[2] = entry.blue;
+            input = &input[1..];
+            out = &mut out[3..];
+        }
+        if out.len() >= 3 && !input.is_empty() {
+            let rgba = &palette[input[0] as usize].0;
+            out[0..3].copy_from_slice(&rgba[0..3]);
         }
     } else if components == 4 {
-        for (in_px, px) in input.iter().zip(out.chunks_exact_mut(4)) {
-            let entry = palette[usize::from(*in_px) % 256];
+        let mut out_chunks = out.chunks_exact_mut(8);
+        let mut input_iter = input.chunks_exact(2);
 
-            px[0] = entry.red;
-            px[1] = entry.green;
-            px[2] = entry.blue;
-            px[3] = entry.alpha;
+        for (in_px, px) in input_iter.by_ref().zip(out_chunks.by_ref()) {
+            let entry0 = palette[usize::from(in_px[0])];
+            let entry1 = palette[usize::from(in_px[1])];
+
+            px[0..4].copy_from_slice(&entry0.0);
+            px[4..8].copy_from_slice(&entry1.0);
+        }
+
+        let rem_in = input_iter.remainder();
+        let rem_out = out_chunks.into_remainder();
+        for (in_px, px) in rem_in.iter().zip(rem_out.chunks_exact_mut(4)) {
+            let entry = palette[usize::from(*in_px)];
+            px.copy_from_slice(&entry.0)
+        }
+    }
+}
+
+pub(crate) fn expand_palette_sub_byte(
+    input: &[u8],
+    out: &mut [u8],
+    palette: &[PLTEEntry; 256],
+    components: usize,
+    depth: u8,
+    width: usize, // We need width to avoid over-writing trailing padding bits
+) {
+    let mut px_processed = 0;
+
+    if depth == 4 {
+        let out_bytes_per_loop = components * 2; // 2 pixels per byte
+        let mut out_chunks = out.chunks_mut(out_bytes_per_loop);
+
+        for (&in_byte, out_chunk) in input.iter().zip(out_chunks.by_ref()) {
+            if px_processed >= width {
+                break;
+            }
+
+            let entry0 = &palette[usize::from((in_byte >> 4) & 0x0F)];
+            let entry1 = &palette[usize::from(in_byte & 0x0F)];
+
+            out_chunk[0..3].copy_from_slice(&entry0.0[0..3]);
+
+            if components == 4 {
+                out_chunk[3] = entry0.0[3];
+            }
+
+            let offset = components;
+            if px_processed + 1 < width {
+                out_chunk[offset..offset + 3].copy_from_slice(&entry1.0[..3]);
+
+                if components == 4 {
+                    out_chunk[offset + 3] = entry1.0[3];
+                }
+            }
+            px_processed += 2;
+        }
+    } else if depth == 2 {
+        let out_bytes_per_loop = components * 4; // 4 pixels per byte
+        let mut out_chunks = out.chunks_mut(out_bytes_per_loop);
+
+        for (&in_byte, out_chunk) in input.iter().zip(out_chunks.by_ref()) {
+            if px_processed >= width {
+                break;
+            }
+
+            for i in 0..4 {
+                if px_processed + i >= width {
+                    break;
+                }
+                let shift = 6 - (i * 2);
+                let entry = &palette[usize::from((in_byte >> shift) & 0x03)];
+                let offset = i * components;
+
+                out_chunk[offset..offset + 3].copy_from_slice(&entry.0[..3]);
+
+                if components == 4 {
+                    out_chunk[offset + 3] = entry.0[3];
+                }
+            }
+            px_processed += 4;
+        }
+    } else if depth == 1 {
+        let out_bytes_per_loop = components * 8; // 8 pixels per byte
+        let mut out_chunks = out.chunks_mut(out_bytes_per_loop);
+
+        for (&in_byte, out_chunk) in input.iter().zip(out_chunks.by_ref()) {
+            if px_processed >= width {
+                break;
+            }
+
+            for i in 0..8 {
+                if px_processed + i >= width {
+                    break;
+                }
+                let shift = 7 - i;
+                let entry = &palette[usize::from((in_byte >> shift) & 0x01)];
+
+                let offset = i * components;
+                out_chunk[offset..offset + 3].copy_from_slice(&entry.0[..3]);
+
+                if components == 4 {
+                    out_chunk[offset + 3] = entry.0[3];
+                }
+            }
+            px_processed += 8;
         }
     }
 }
@@ -120,7 +155,7 @@ pub(crate) fn expand_palette(
 /// * `depth`:  The depth of the image
 ///
 pub fn expand_trns<const SIXTEEN_BITS: bool>(
-    input: &[u8], out: &mut [u8], color: PngColor, trns_bytes: [u16; 4], depth: u8
+    input: &[u8], out: &mut [u8], color: PngColor, trns_bytes: [u16; 4], depth: u8,
 ) {
     const DEPTH_SCALE_TABLE: [u8; 9] = [0, 0xff, 0x55, 0, 0x11, 0, 0, 0, 0x01];
 
@@ -135,7 +170,7 @@ pub fn expand_trns<const SIXTEEN_BITS: bool>(
     if SIXTEEN_BITS {
         match color {
             PngColor::Luma => {
-                let trns_byte = trns_bytes[0].to_ne_bytes();
+                let trns_byte = trns_bytes[0].to_be_bytes();
 
                 for (in_chunk, chunk) in input.chunks_exact(2).zip(out.chunks_exact_mut(4)) {
                     chunk[..2].copy_from_slice(in_chunk);
@@ -150,9 +185,9 @@ pub fn expand_trns<const SIXTEEN_BITS: bool>(
                 }
             }
             PngColor::RGB => {
-                let r = trns_bytes[0].to_ne_bytes();
-                let g = trns_bytes[1].to_ne_bytes();
-                let b = trns_bytes[2].to_ne_bytes();
+                let r = trns_bytes[0].to_be_bytes();
+                let g = trns_bytes[1].to_be_bytes();
+                let b = trns_bytes[2].to_be_bytes();
 
                 // copy all trns chunks into one big vector
                 let mut all: [u8; 6] = [0; 6];
@@ -175,7 +210,7 @@ pub fn expand_trns<const SIXTEEN_BITS: bool>(
                     }
                 }
             }
-            _ => unreachable!()
+            _ => unreachable!(),
         }
     } else {
         match color {
@@ -183,7 +218,6 @@ pub fn expand_trns<const SIXTEEN_BITS: bool>(
                 let scale = DEPTH_SCALE_TABLE[usize::from(depth)];
 
                 let depth_mask = (1_u16 << depth) - 1;
-                // BUG: This overflowing is indicative of a wrong tRNS value
                 let trns_byte = (((trns_bytes[0]) & 255 & depth_mask) as u8) * scale;
 
                 for (in_byte, chunk) in input.iter().zip(out.chunks_exact_mut(2)) {
@@ -209,14 +243,14 @@ pub fn expand_trns<const SIXTEEN_BITS: bool>(
                     chunk[3] = 255 * u8::from(mask);
                 }
             }
-            _ => unreachable!()
+            _ => unreachable!(),
         }
     }
 }
 
 /// Expand bits to bytes expand images with less than 8 bpp
 pub(crate) fn expand_bits_to_byte(
-    width: usize, depth: usize, out_n: usize, plte_present: bool, input: &[u8], out: &mut [u8]
+    width: usize, depth: usize, out_n: usize, plte_present: bool, input: &[u8], out: &mut [u8],
 ) {
     let scale = if plte_present {
         // When a palette is used we only separate the indexes in this pass,
@@ -227,7 +261,7 @@ pub(crate) fn expand_bits_to_byte(
             1 => 0xFF,
             2 => 0x55,
             4 => 0x11,
-            _ => return
+            _ => return,
         }
     };
 
@@ -347,7 +381,9 @@ pub(crate) fn add_alpha(input: &[u8], output: &mut [u8], colorspace: PngColor, d
                 out_chunk[7] = 255;
             }
         }
-        (a, b) => panic!("Unknown combination of depth {a:?} and color type for expand alpha {b:?}")
+        (a, b) => {
+            panic!("Unknown combination of depth {a:?} and color type for expand alpha {b:?}")
+        }
     }
 }
 
@@ -357,7 +393,7 @@ pub fn convert_u16_to_u8_slice(slice: &mut [u16]) -> &mut [u8] {
     unsafe {
         core::slice::from_raw_parts_mut(
             slice.as_ptr() as *mut u8,
-            slice.len().checked_mul(2).unwrap()
+            slice.len().checked_mul(2).unwrap(),
         )
     }
 }

@@ -54,7 +54,7 @@ pub enum Gravity {
     /// Place the image so that it appears from the bottom left of the canvas
     BottomLeft,
     /// Place the image so that it appears from the bottom right of the canvas
-    BottomRight
+    BottomRight,
 }
 
 pub fn calculate_gravity(src_image: &Image, dst_image: &Image, gravity: Gravity) -> (usize, usize) {
@@ -79,13 +79,13 @@ pub fn calculate_gravity(src_image: &Image, dst_image: &Image, gravity: Gravity)
         Gravity::BottomLeft => (0, dst_height.saturating_sub(src_height)),
         Gravity::BottomRight => (
             dst_width.saturating_sub(src_width),
-            dst_height.saturating_sub(src_height)
-        )
+            dst_height.saturating_sub(src_height),
+        ),
     };
 }
 /// A simple helper function to execute on threads
 pub fn execute_on<T: Fn(&mut Channel) -> Result<(), ImageErrors> + Send + Sync>(
-    function: T, image: &mut Image, ignore_alpha: bool
+    function: T, image: &mut Image, ignore_alpha: bool,
 ) -> Result<(), ImageErrors> {
     #[cfg(feature = "threads")]
     {
@@ -110,5 +110,18 @@ pub fn execute_on<T: Fn(&mut Channel) -> Result<(), ImageErrors> + Send + Sync>(
             function(channel)?;
         }
         Ok(())
+    }
+}
+
+/// A mutable array impl that matches core::slice::as_mut_array but can be used on
+/// lower msrv ( the core was stabilized in 1.93 and the crate msrv is 1.78)
+pub(crate) fn as_mut_array<T: Copy, const N: usize>(array: &mut [T]) -> Option<&mut [T; N]> {
+    if array.len() == N {
+        let ptr = array.as_mut_ptr().cast();
+        // SAFETY: The underlying array of a slice can be reinterpreted as an actual array `[T; N]` if `N` is not greater than the slice's length.
+        let me = unsafe { &mut *ptr };
+        Some(me)
+    } else {
+        None
     }
 }

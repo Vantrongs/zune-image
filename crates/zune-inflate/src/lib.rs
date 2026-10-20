@@ -25,7 +25,7 @@
 //!
 //! ## Alternatives
 //!- For the fastest speeds, check out [libdeflate] (C), if using Rust there is [libdeflater] which
-//! provides bindings to [libdeflate]
+//!  provides bindings to [libdeflate]
 //!
 //!- For streaming support use [flate2-rs] with an appropriate backend(zlib-ng is recommended for speed)
 //!  
@@ -88,9 +88,11 @@
 //!
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
+extern crate core;
 
 pub use crate::decoder::{DeflateDecoder, DeflateOptions};
 pub use crate::encoder::DeflateEncoder;
+pub use crate::streaming_decoder::{StreamingDecoder,DecodeStatus};
 
 mod bitstream;
 mod constants;
@@ -99,4 +101,6 @@ mod decoder;
 mod encoder;
 pub mod errors;
 mod gzip_constants;
+mod streaming_decoder;
+mod tests;
 mod utils;

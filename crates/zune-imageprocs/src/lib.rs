@@ -37,35 +37,47 @@
     clippy::panic
 )]
 #![allow(
+    clippy::items_after_statements,
     clippy::needless_return,
     clippy::similar_names,
     clippy::inline_always,
-    clippy::similar_names,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
     clippy::doc_markdown,
     clippy::module_name_repetitions,
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
     clippy::wildcard_imports,
-    unexpected_cfgs
+    unexpected_cfgs,
+    clippy::too_many_lines
 )]
 
+pub use filter_ext::FilterExt;
 pub use zune_image;
 
+pub mod affine;
+pub mod append;
 pub mod auto_orient;
+pub mod average;
 pub mod bilateral_filter;
 pub mod blend;
 pub mod box_blur;
 pub mod brighten;
+mod clahe;
 pub mod color_matrix;
+pub mod color_transform;
 pub mod composite;
 pub mod contrast;
 pub mod convolve;
 pub mod crop;
 pub mod exposure;
+pub mod filter_ext;
 pub mod flip;
+pub mod fx;
 pub mod gamma;
-pub mod gaussian_blur;
-pub mod color_transform;
+pub mod blur;
+pub mod hald_clut;
 pub mod histogram;
 pub mod hsv_adjust;
 pub mod invert;
@@ -74,19 +86,22 @@ pub mod median;
 pub mod mirror;
 pub mod pad;
 pub mod premul_alpha;
-mod prewitt;
 pub mod resize;
 pub mod rotate;
 pub mod scharr;
+pub mod sharpen;
+pub mod smush;
 pub mod sobel;
 pub mod spatial;
 pub mod spatial_ops;
+pub mod ssim;
 pub mod stretch_contrast;
+pub mod swap;
 pub mod threshold;
 pub mod traits;
+pub mod transfer_curve;
 pub mod transpose;
-pub mod unsharpen;
 mod utils;
-mod image_transfer;
-pub mod affine;
-mod clahe;
+
+#[macro_use]
+pub(crate)  mod macro_utils;

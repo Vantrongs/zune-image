@@ -63,7 +63,7 @@ fn whole_decoding_stops_with_its_progress() {
             JpegDecoder::new_with_options(ProgressCursor::new(&bytes, &progress), options());
         let result = decoder.decode_with_progress(&progress);
         assert!(
-            matches!(result, Err(DecodeErrors::Stopped)),
+            matches!(result, Err(DecodeErrors::Cancelled)),
             "{name}: {result:?}"
         );
         // The last report is at most a row of MCUs of 4000 pixels in three components.

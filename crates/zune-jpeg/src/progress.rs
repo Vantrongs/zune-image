@@ -29,10 +29,10 @@ pub(crate) fn stopped(progress: &dyn Progress) -> bool {
     progress.advance(0)
 }
 
-/// Counts `work` on `progress`, failing with [`DecodeErrors::Stopped`] once it stops.
+/// Counts `work` on `progress`, failing with [`DecodeErrors::Cancelled`] once it stops.
 pub(crate) fn advance(progress: &dyn Progress, work: usize) -> Result<(), DecodeErrors> {
     if progress.advance(work) {
-        Err(DecodeErrors::Stopped)
+        Err(DecodeErrors::Cancelled)
     } else {
         Ok(())
     }

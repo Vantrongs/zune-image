@@ -184,6 +184,30 @@ fn data_cut_anywhere_reads_as_the_whole_decode_and_resumes() {
     }
 }
 
+/// Entropy-coded data broken at any byte, without forming a marker, reads as the
+/// whole-image decoder gives it: rows past a break the decoder gives up at are gray.
+#[test]
+fn data_broken_anywhere_reads_as_the_whole_decode() {
+    let bytes = fixture("33x41-r3.jpg");
+    let sos = bytes.windows(2).position(|p| p == [255, 218]).unwrap();
+    let first = sos + 2 + usize::from(u16::from_be_bytes([bytes[sos + 2], bytes[sos + 3]]));
+    let mut gave_up = 0;
+    for at in first..bytes.len() - 2 {
+        let mut input = bytes.clone();
+        input[at] ^= 0x5a;
+        if bytes[at] == 0xff || input[at] == 0xff || input[at - 1] == 0xff {
+            continue;
+        }
+        for strict in [false, true] {
+            let expected = full(&input, options(strict));
+            gave_up += usize::from(expected.as_ref().is_ok_and(|p| p.ends_with(&[128; 33 * 8])));
+            let mut rows = GrayscaleRows::new(input.as_slice(), options(strict), &()).unwrap();
+            assert_eq!(drain(&mut rows), expected, "at={at} strict={strict}");
+        }
+    }
+    assert!(gave_up > 0);
+}
+
 #[test]
 fn unsupported_images_foreign_checkpoints_and_failed_readers_are_rejected() {
     for name in ["color.jpg", "progressive.jpg"] {

@@ -22,25 +22,28 @@
 //!|--------------|---------------|----------------|
 //!| bmp          | zune-bmp      |     -          |
 //!| jpeg         | zune-jpeg     | [jpeg-encoder] |
-//!| png          | zune-png      | zune-png       |
+//!| png          | [image-png]   | [image-png]    |
 //!| ppm          | zune-ppm      | zune-ppm       |
 //!| qoi          | zune-qoi      | zune-qoi       |
 //!| farbfeld     | zune-farbfeld | zune-farbfeld  |
 //!| psd          | zune-psd      | -              |
 //!| jpeg-xl      | [jxl-oxide]   | zune-jpegxl    |
 //!| hdr          | zune-hdr      | zune-hdr       |
+//! webp          | [image-webp]  | [image-webp]   |
+//! heic          | zune-heic     | -              |
+//!
 //!
 //!
 //! ### Image filters
 //!
 //! Image filters are divided into two types,
 //!  - core filters: Things needed to enable conversions from one format to another.
-//!                 This may include color conversion and depth conversion routines.
-//!                 These are in `zune-image` crate
+//!    This may include color conversion and depth conversion routines.
+//!    These are in `zune-image` crate
 //!  - extra filters: This include algorithms that do more complex pixel manipulations,
-//!     including contrast adjustment, resizing, blurring etc, the algorithms are usually
-//!     implemented in `zune-imageprocs` by the processes implementing
-//!     [OperationsTrait](crate::traits::OperationsTrait)
+//!    including contrast adjustment, resizing, blurring etc, the algorithms are usually
+//!    implemented in `zune-imageprocs` by the processes implementing
+//!    [OperationsTrait](crate::traits::OperationsTrait)
 //!
 //!  # High level api
 //! Load images using image `open`
@@ -85,9 +88,11 @@
 //! convenient methods to access image channels. This returns all image channels,traversing frames and concatenating it together
 //!
 //!
-//![image]:https://crates.io/crates/image
+//! [image]:https://crates.io/crates/image
+//! [image-png]: https://crates.io/crates/png
 //! [jpeg-encoder]: https://crates.io/crates/jpeg-encoder
 //! [jxl-oxide]: https://crates.io/crates/jxl-oxide
+//! [image-webp]: https://crates.io/crates/image-webp
 #![allow(
     clippy::redundant_field_names,
     clippy::uninlined_format_args,
@@ -111,3 +116,7 @@ mod serde;
 mod tests;
 pub mod traits;
 pub mod utils;
+pub mod iters;
+pub mod colors;
+pub mod web;
+pub mod planar_regions;

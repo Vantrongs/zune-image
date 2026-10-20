@@ -3,9 +3,8 @@
 use std::io::{BufRead, Seek, Write};
 
 use image_webp::{ColorType, DecodingError, WebPEncoder};
-use jxl_oxide::color::WhitePoint::E;
 use zune_core::bit_depth::BitDepth;
-use zune_core::bytestream::ZByteWriterTrait;
+use zune_core::bytestream::{ZByteReaderTrait, ZByteWriterTrait};
 use zune_core::colorspace::ColorSpace;
 use zune_core::log::{trace, warn};
 
@@ -13,7 +12,7 @@ use crate::codecs::{create_options_for_encoder, ImageFormat};
 use crate::errors::{ImageErrors, ImgEncodeErrors};
 use crate::image::Image;
 use crate::metadata::{AlphaState, ImageMetadata};
-use crate::traits::{DecoderTrait, EncoderTrait};
+use crate::traits::{DecodeInto, DecoderTrait, EncoderTrait};
 
 pub struct ZuneWebpDecoder<T: BufRead + Seek> {
     inner: image_webp::WebPDecoder<T>
@@ -24,7 +23,7 @@ impl<T: BufRead + Seek> ZuneWebpDecoder<T> {
             println!("{:?}", e);
             ImageErrors::ImageDecodeErrors(e.to_string())
         })?;
-        return Ok(ZuneWebpDecoder { inner: decoder });
+        Ok(ZuneWebpDecoder { inner: decoder })
     }
 }
 impl<T: BufRead + Seek> DecoderTrait for ZuneWebpDecoder<T> {
@@ -66,24 +65,24 @@ impl<T: BufRead + Seek> DecoderTrait for ZuneWebpDecoder<T> {
     }
     fn read_headers(&mut self) -> Result<Option<ImageMetadata>, ImageErrors> {
         let (w, h) = self.dimensions().expect("Failed to determine dimensions");
-        return Ok(Some(ImageMetadata {
-            color_trc: None,
-            default_gamma: None,
+        Ok(Some(ImageMetadata {
             width: w,
             height: h,
             colorspace: self.out_colorspace(),
             depth: BitDepth::Eight,
             format: Some(ImageFormat::WEBP),
-            alpha: AlphaState::NonPreMultiplied,
-            #[cfg(feature = "metadata")]
-            exif: None,
-            icc_chunk: None,
-            is_linear: false
-        }));
+            ..ImageMetadata::default()
+        }))
     }
 }
 
 pub struct ZuneWebpImageEncoder {}
+impl Default for ZuneWebpImageEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ZuneWebpImageEncoder {
     pub fn new() -> Self {
         Self {}
@@ -170,5 +169,27 @@ impl EncoderTrait for ZuneWebpImageEncoder {
     }
     fn default_depth(&self, depth: BitDepth) -> BitDepth {
         BitDepth::Eight
+    }
+}
+
+impl<T> DecodeInto for ZuneWebpDecoder<T>
+where
+    T: BufRead + Seek
+{
+    type BufferType = u8;
+
+    fn decode_into(&mut self, buffer: &mut [Self::BufferType]) -> Result<(), ImageErrors> {
+        self.inner
+            .read_image(buffer)
+            .map_err(|e| ImageErrors::ImageDecodeErrors(e.to_string()))?;
+
+        Ok(())
+    }
+
+    fn decode_output_buffer_size(&mut self) -> Result<usize, ImageErrors> {
+        Ok(self
+            .inner
+            .output_buffer_size()
+            .expect("Max output size greater than usize max"))
     }
 }

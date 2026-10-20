@@ -29,6 +29,23 @@ use crate::metadata::AlphaState::NonPreMultiplied;
 use crate::metadata::{AlphaState, ImageMetadata};
 use crate::pipelines::EncodeResult;
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum OperationColorValues {
+    /// This operation works purely in gamma light
+    /// meaning  image should be in gamma-encoded
+    /// colorspace e.g like sRGB e.g hald_clut,color matrix, brighten
+    Gamma,
+    /// This operation works purely in linear light
+    /// meaning the image should have been in linear light
+    /// E.g resize, colorspace conversions, sobel,affine
+    Linear,
+    /// This operation does not care about the colorspace it is in
+    /// will work for linear and gamma.
+    ///
+    /// E.g cropping, flipping
+    Any,
+}
+
 /// Encapsulates an image decoder.
 ///
 /// All supported image decoders must implement this class
@@ -65,7 +82,7 @@ pub trait DecoderTrait {
     /// # Returns
     /// - Some(width,height)
     /// - None -> If image hasn't been decoded and we can't extract
-    ///  the width and height.
+    ///   the width and height.
     fn dimensions(&self) -> Option<(usize, usize)>;
 
     /// Get the colorspace that the decoded pixels
@@ -94,7 +111,7 @@ pub trait DecoderTrait {
 ///
 /// All operations that can be stored in a workflow
 /// need to encapsulate this struct.
-pub trait OperationsTrait: Send + Sync {
+pub trait OperationsTrait {
     /// Get the name of this operation
     fn name(&self) -> &'static str;
 
@@ -134,8 +151,7 @@ pub trait OperationsTrait: Send + Sync {
     ///
     /// # Arguments
     /// - image: A mutable reference to an image which
-    /// this operation will manipulate
-    ///
+    ///   this operation will manipulate
     ///
     /// # Errors
     /// Any operations error will be propagated to the caller
@@ -146,10 +162,7 @@ pub trait OperationsTrait: Send + Sync {
         // Confirm colorspace
         let colorspace = image.colorspace();
 
-        let supported = self
-            .supported_colorspaces()
-            .iter()
-            .any(|x| *x == colorspace);
+        let supported = self.supported_colorspaces().contains(&colorspace);
 
         if !supported {
             match colorspace {
@@ -165,30 +178,25 @@ pub trait OperationsTrait: Send + Sync {
                     return Err(ImageErrors::UnsupportedColorspace(
                         colorspace,
                         self.name(),
-                        self.supported_colorspaces()
+                        self.supported_colorspaces(),
                     ));
                 }
             }
         }
-        // if image.metadata.alpha != self.alpha_state()
-        // {
-        //     PremultiplyAlpha::new(self.alpha_state());
-        // }
-        // check we support the bit depth
+
         let bit_type = image.metadata.depth().bit_type();
 
-        let supported = self.supported_types().iter().any(|x| *x == bit_type);
+        let supported = self.supported_types().contains(&bit_type);
 
         if !supported {
             return Err(ImageErrors::OperationsError(
-                ImageOperationsErrors::UnsupportedType(self.name(), bit_type)
+                ImageOperationsErrors::UnsupportedType(self.name(), bit_type),
             ));
         }
 
         confirm_invariants(image)?;
 
-        self.execute_impl(image)
-            .map_err(<ImageErrors as Into<ImageErrors>>::into)?;
+        self.execute_impl(image)?;
 
         confirm_invariants(image)?;
 
@@ -203,6 +211,10 @@ pub trait OperationsTrait: Send + Sync {
         AlphaState::PreMultiplied
     }
 
+    fn operation_color_values(&self) -> OperationColorValues {
+        OperationColorValues::Any
+    }
+
     /// Clone the image and execute the operation on it, returning
     /// a new image instead of modifying the existing one
     ///
@@ -212,6 +224,25 @@ pub trait OperationsTrait: Send + Sync {
         let mut c_img = image.clone();
         self.execute(&mut c_img)?;
         Ok(c_img)
+    }
+    /// Execute the operation on a stack of images.
+    ///
+    /// By default, this iterates through all images in the stack and applies
+    /// the single-image operation to each one. Multi-image operations
+    /// (like Composite) should override this to manipulate the stack directly.
+    fn execute_multiple(&self, images: &mut Vec<Image>) -> Result<(), ImageErrors> {
+        for image in images.iter_mut() {
+            self.execute(image)?;
+        }
+        Ok(())
+    }
+    /// Returns a printable result string after the operation has executed.
+    ///
+    /// By default, image operations do not produce text output, so this returns `None`.
+    /// Metric-based operations (like SSIM or image statistics) can override this
+    /// to format and return their results.
+    fn printable_result(&self) -> Option<String> {
+        None
     }
 }
 
@@ -242,7 +273,7 @@ fn confirm_invariants(image: &Image) -> Result<(), ImageErrors> {
         if channel.len() != expected_length {
             return Err(ImageErrors::DimensionsMisMatch(
                 expected_length,
-                channel.len()
+                channel.len(),
             ));
         }
     }
@@ -261,20 +292,20 @@ pub trait EncoderTrait {
     /// by asking for it during initialization
     ///
     /// - Note: Callers should use the [encode] function and not this function
-    /// as that does some necessary conversions for an image to prepare it for encoding
+    ///   as that does some necessary conversions for an image to prepare it for encoding
     ///
     /// # Arguments
     /// - image: An image which we are trying to encode.
     ///
     /// # Returns
     /// - `Ok(usize)`: The number of bytes written into `sink`
-    /// in the format [ImageFormat]
+    ///   in the format [ImageFormat]
     ///
     /// - Err : An unrecoverable error occurred
     ///
     /// [encode]: EncoderTrait::encode
     fn encode_inner<T: ZByteWriterTrait>(
-        &mut self, image: &Image, sink: T
+        &mut self, image: &Image, sink: T,
     ) -> Result<usize, ImageErrors>;
 
     /// Return all colorspaces supported by this encoder.
@@ -297,7 +328,7 @@ pub trait EncoderTrait {
     /// # Returns
     ///
     /// - `Ok(usize)`: The number of bytes written into `sink`
-    /// in the format [ImageFormat]
+    ///   in the format [ImageFormat]
     ///
     /// - Err : An unrecoverable error occurred
     ///
@@ -307,7 +338,7 @@ pub trait EncoderTrait {
     /// is recommended to have the image in a format that can be encoded
     /// directly to prevent such
     fn encode<T: ZByteWriterTrait>(
-        &mut self, image: &Image, sink: T
+        &mut self, image: &Image, sink: T,
     ) -> Result<usize, ImageErrors> {
         // confirm things hold themselves
         confirm_invariants(image)?;
@@ -389,8 +420,8 @@ pub trait EncoderTrait {
         let data = self.encode(image, &mut sink)?;
 
         Ok(EncodeResult {
-            data:   vec![],
-            format: self.format()
+            data: sink,
+            format: self.format(),
         })
     }
     /// Get supported bit-depths for this image
@@ -503,5 +534,6 @@ pub trait DecodeInto {
 /// Convert something into an image by consuming it
 pub trait IntoImage {
     /// Consumes this and returns an image
+    #[allow(clippy::wrong_self_convention)]
     fn into_image(&mut self) -> Result<Image, ImageErrors>;
 }

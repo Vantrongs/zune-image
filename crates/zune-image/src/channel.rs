@@ -47,27 +47,38 @@ pub enum ChannelErrors {
     /// rarely, since all allocations are aligned to 16, but just in case
     UnalignedPointer(usize, usize),
     /// The length of the type does not evenly divide the channel length
-    /// Indicating that wea re trying to align the channel data to something
+    /// Indicating that we are trying to align the channel data to something
     /// that does not evenly divide it
     UnevenLength(usize, usize),
-    DifferentType(TypeId, TypeId)
+    DifferentType(TypeId, TypeId),
+    /// The buffer aligned will not fit the interleave
+    BufferTooSmall {
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl Debug for ChannelErrors {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ChannelErrors::UnalignedPointer(expected, found) => {
-                writeln!(f, "Channel pointer {expected} is not aligned to {found}")
+                write!(f, "Channel pointer {expected} is not aligned to {found}")
             }
             ChannelErrors::UnevenLength(length, size_of_1) => {
-                writeln!(
+                write!(
                     f,
                     "Size of {size_of_1} cannot evenly divide length {length}"
                 )
             }
             ChannelErrors::DifferentType(expected, found) => {
-                writeln!(f, "Different type id {:?} from expected {:?}. This indicates you are converting a channel
+                write!(f, "Different type id {:?} from expected {:?}. This indicates you are converting a channel
              to a type it wasn't instantiated with", expected, found)
+            }
+            ChannelErrors::BufferTooSmall { expected, actual } => {
+                write!(
+                    f,
+                    "Buffer too small, expected at least {expected} but got {actual}"
+                )
             }
         }
     }
@@ -82,12 +93,14 @@ impl Debug for ChannelErrors {
 /// `reinterpret` methods, both as reference and as mutable.
 #[derive(Eq)]
 pub struct Channel {
-    ptr:      *mut u8,
-    length:   usize,
+    ptr: *mut u8,
+    length: usize,
     capacity: usize,
     // type id for which the channel was created with
-    type_id:  TypeId,
-    layout:   Layout
+    type_id: TypeId,
+    // size of the type (from sizeof)
+    size_of: usize,
+    layout: Layout,
 }
 
 // safety: The functions ae unsafe because the
@@ -100,7 +113,8 @@ unsafe impl Sync for Channel {}
 
 impl Clone for Channel {
     fn clone(&self) -> Self {
-        let mut new_channel = Channel::new_with_capacity_and_type(self.capacity(), self.type_id);
+        let mut new_channel =
+            Channel::new_with_capacity_and_type(self.capacity(), self.size_of, self.type_id);
         // copy items by calling extend
 
         // Safety:
@@ -218,6 +232,18 @@ impl Channel {
     }
     /// Reallocate the pointer in place increasing
     /// it's capacity
+    ///
+    /// # Safety
+    ///
+    /// See [`GlobalAlloc::realloc`].
+    ///
+    /// From above these are the only concerns
+    ///
+    /// * `new_size` is greater than zero.
+    ///
+    /// * `new_size`, when rounded up to the nearest multiple of `layout.align()`,
+    ///   does not overflow `isize` (i.e., the rounded value must be less than or
+    ///   equal to `isize::MAX`).
     pub unsafe fn realloc(&mut self, new_size: usize) {
         self.ptr = unsafe { realloc(self.ptr, self.layout, new_size) };
         // set capacity to be new size
@@ -261,7 +287,14 @@ impl Channel {
     ///  - type_id: The type id of the type this is supposed to store
     ///
     pub fn new_with_length_and_type(length: usize, type_id: TypeId) -> Channel {
-        let mut channel = Channel::new_with_capacity_and_type(length, type_id);
+        let size = if TypeId::of::<u8>() == type_id {
+            size_of::<u8>()
+        } else if type_id == TypeId::of::<u16>() {
+            size_of::<u16>()
+        } else {
+            size_of::<u32>()
+        };
+        let mut channel = Channel::new_with_capacity_and_type(length, size, type_id);
         channel.length = length;
 
         channel
@@ -289,7 +322,7 @@ impl Channel {
             BitType::U8 => TypeId::of::<u8>(),
             BitType::U16 => TypeId::of::<u16>(),
             BitType::F32 => TypeId::of::<f32>(),
-            _ => unimplemented!("Bit-depth :{:?}", depth)
+            _ => unimplemented!("Bit-depth :{:?}", depth),
         };
 
         Self::new_with_length_and_type(length, t_r)
@@ -311,6 +344,11 @@ impl Channel {
     pub fn type_id(&self) -> TypeId {
         self.type_id
     }
+    /// Get the size of the item in the channel
+    /// (kind of works)
+    pub(crate) fn size_of(&self) -> usize {
+        self.size_of
+    }
     /// Create a new channel with the specified capacity
     /// and zero length
     ///
@@ -321,7 +359,7 @@ impl Channel {
     /// assert!(channel.is_empty());
     /// ```
     pub fn new_with_capacity<T: 'static + Zeroable>(capacity: usize) -> Channel {
-        Self::new_with_capacity_and_type(capacity, TypeId::of::<T>())
+        Self::new_with_capacity_and_type(capacity, core::mem::size_of::<T>(), TypeId::of::<T>())
     }
 
     /// Create a new channel with a specified
@@ -334,15 +372,18 @@ impl Channel {
     ///
     /// returns: Channel
     ///
-    pub(crate) fn new_with_capacity_and_type(capacity: usize, type_id: TypeId) -> Channel {
+    pub(crate) fn new_with_capacity_and_type(
+        capacity: usize, size_of: usize, type_id: TypeId,
+    ) -> Channel {
         let (ptr, layout) = unsafe { Self::alloc(capacity) };
 
         Self {
             ptr,
             length: 0,
             capacity,
+            size_of,
             type_id,
-            layout
+            layout,
         }
     }
 
@@ -364,7 +405,7 @@ impl Channel {
     /// ```
     pub fn from_elm<T>(length: usize, elm: T) -> Channel
     where
-        T: Clone + Copy + 'static + Zeroable + Pod
+        T: Clone + Copy + 'static + Zeroable + Pod,
     {
         // new currently zeroes memory
         let mut new_chan = Channel::new_with_length::<T>(length * size_of::<T>());
@@ -419,7 +460,7 @@ impl Channel {
         unsafe {
             self.ptr.wrapping_add(self.length).copy_from(
                 data.as_ptr().cast::<u8>(),
-                data.len().saturating_mul(data_size)
+                data.len().saturating_mul(data_size),
             );
         }
 
@@ -553,7 +594,7 @@ impl Channel {
     /// ```
     pub fn fill<T>(&mut self, element: T) -> Result<(), ChannelErrors>
     where
-        T: Clone + Copy + 'static + Pod
+        T: Clone + Copy + 'static + Pod,
     {
         // reinterpret to be type T
         let array = self.reinterpret_as_mut()?;
@@ -570,12 +611,12 @@ impl Channel {
         if !is_aligned::<T>(self.ptr) {
             return Err(ChannelErrors::UnalignedPointer(
                 self.ptr as usize,
-                size_of::<T>()
+                size_of::<T>(),
             ));
         }
 
         // confirm we can evenly divide length
-        if self.length % size_of::<T>() != 0 {
+        if !self.length.is_multiple_of(size_of::<T>()) {
             return Err(ChannelErrors::UnevenLength(self.length, size_of::<T>()));
         }
         let converted_type_id = TypeId::of::<T>();
@@ -583,7 +624,7 @@ impl Channel {
         if converted_type_id != self.type_id {
             return Err(ChannelErrors::DifferentType(
                 self.type_id,
-                converted_type_id
+                converted_type_id,
             ));
         }
 

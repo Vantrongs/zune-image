@@ -7,6 +7,9 @@
  */
 
 use zune_core::bytestream::ZCursor;
+use zune_core::colorspace::ColorSpace;
+use zune_core::options::DecoderOptions;
+use zune_jpeg::errors::DecodeErrors;
 use zune_jpeg::JpegDecoder;
 
 #[test]
@@ -27,10 +30,16 @@ fn bad_ff_marker_size() {
 fn bad_number_of_scans() {
     let mut decoder = JpegDecoder::new(ZCursor::new([255, 216, 255, 218, 232, 197, 255]));
 
+    // The input claims an SOS length of 59589 but only contains a handful of
+    // bytes. With atomic marker parsing the truncation surfaces first as
+    // `ExhaustedData`; without more bytes the decode cannot complete. We
+    // accept either the original `SosError` message (if the parser ever
+    // gets to see a complete-but-malformed body) or a recoverable EOF path.
     let err = decoder.decode().unwrap_err();
-
     assert!(
-        matches!(err, zune_jpeg::errors::DecodeErrors::SosError(x) if x == "Bad SOS length 59589,corrupt jpeg")
+        err.is_recoverable_eof()
+            || matches!(err, zune_jpeg::errors::DecodeErrors::SosError(_)),
+        "unexpected error variant: {err:?}"
     );
 }
 
@@ -38,10 +47,15 @@ fn bad_number_of_scans() {
 fn huffman_length_subtraction_overflow() {
     let mut decoder = JpegDecoder::new(ZCursor::new([255, 216, 255, 196, 0, 0]));
 
+    // A length field below 2 is a hard marker-format error.
     let err = decoder.decode().unwrap_err();
-
     assert!(
-        matches!(err, zune_jpeg::errors::DecodeErrors::FormatStatic(x) if x == "Invalid Huffman length in image")
+        matches!(
+            err,
+            zune_jpeg::errors::DecodeErrors::FormatStatic(_)
+                | zune_jpeg::errors::DecodeErrors::Format(_)
+        ),
+        "unexpected error variant: {err:?}"
     );
 }
 
@@ -58,14 +72,240 @@ fn mul_with_overflow() {
         255, 216, 255, 192, 255, 1, 8, 9, 119, 48, 255, 192
     ]));
 
+    // SOF with claimed length 65281 in a 12-byte input is simultaneously
+    // truncated and malformed. With atomic marker parsing the truncation
+    // surfaces first as `ExhaustedData`; without more bytes the decode
+    // cannot complete. The original message "Length of start of frame
+    // differs from expected ..." is no longer reachable (the body cannot
+    // be read at all), but any hard failure is acceptable.
     let err = decoder.decode().unwrap_err();
-
     assert!(
-        matches!(err, zune_jpeg::errors::DecodeErrors::SofError(x) if x == "Length of start of frame differs from expected 584,value is 65281")
+        err.is_recoverable_eof()
+            || matches!(err, zune_jpeg::errors::DecodeErrors::SofError(_)),
+        "unexpected error variant: {err:?}"
     );
 }
 
+#[test]
+fn baseline_scan_count_is_limited() {
+    // Each baseline scan walks the whole image, so a few bytes per extra scan cost a
+    // full-image pass each. Like progressive images, baseline images may have at
+    // most `max_scans` scans.
+    let data = include_bytes!("../../../test-images/jpeg/tiny_non_interleaved_444.jpg");
+    let limit = zune_core::options::DecoderOptions::default().jpeg_get_max_scans();
+    let mut many = data[..data.len() - 2].to_vec();
+    for _ in 0..limit {
+        // SOS for component 1 with tables 0/0, then four bytes of entropy data
+        many.extend([0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00]);
+        many.extend([0x12, 0x34, 0x56, 0x78]);
+    }
+    many.extend([0xff, 0xd9]);
 
+    JpegDecoder::new(ZCursor::new(data.as_slice()))
+        .decode()
+        .unwrap();
+    let err = JpegDecoder::new(ZCursor::new(many)).decode().unwrap_err();
+    assert!(
+        matches!(&err, zune_jpeg::errors::DecodeErrors::Format(m) if m.contains("Too many scans")),
+        "unexpected error: {err:?}"
+    );
+}
+
+/// Entropy-coded data writer: most significant bit first, 0xFF bytes stuffed, the last
+/// byte padded with 1 bits.
+struct Bits {
+    out: Vec<u8>,
+    acc: u8,
+    n:   u8
+}
+
+impl Bits {
+    fn new() -> Self {
+        Bits {
+            out: vec![],
+            acc: 0,
+            n:   0
+        }
+    }
+
+    fn put(&mut self, value: u32, len: u8) {
+        for i in (0..len).rev() {
+            self.acc = (self.acc << 1) | ((value >> i) & 1) as u8;
+            self.n += 1;
+            if self.n == 8 {
+                self.out.push(self.acc);
+                if self.acc == 0xff {
+                    self.out.push(0x00);
+                }
+                self.acc = 0;
+                self.n = 0;
+            }
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        while self.n != 0 {
+            self.put(1, 1);
+        }
+        self.out
+    }
+}
+
+/// AC symbols of the test table in code order; each code is its index in `code_len` bits.
+const EOB: u32 = 0;
+const LAST: u32 = 1;
+const RUN_11: u32 = 2;
+const ZRL: u32 = 3;
+
+#[derive(Clone, Copy, Debug)]
+enum Layout {
+    /// SOF0, one component.
+    Baseline,
+    /// SOF0, three components decoded to Luma, with the overrun in Cb, whose blocks are
+    /// skipped rather than decoded.
+    BaselineSkipped,
+    /// SOF2, one component: a DC scan, then an AC scan (Ss 1, Se 63).
+    Progressive
+}
+
+/// Blocks per row of the test image. The bad block is the first; the ones after it keep
+/// the decoder away from the end of the input when it fails, where an error is reported
+/// as `ExhaustedData` so that incremental decoding can retry.
+const BLOCKS: u16 = 32;
+
+/// A (8 * BLOCKS)x8 JPEG whose first block has AC data three ZRLs (to zig-zag 49), run 11
+/// with +1 (at 60), then `last_run_and_size` with +1: with 0x91 (run 9) that run ends at
+/// 70, past the end of the block; with 0x21 (run 2) at 63. Every other block is DC 0 and
+/// EOB. The AC codes are `code_len` bits: 12-bit codes are decoded on the slow path,
+/// 3-bit codes through the fast lookup table.
+fn ac_run_past_end(layout: Layout, code_len: u8, last_run_and_size: u8) -> Vec<u8> {
+    let components: u8 = if matches!(layout, Layout::BaselineSkipped) { 3 } else { 1 };
+    let overrun_id = if components == 3 { 2 } else { 1 };
+    let mut data = vec![0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00];
+    data.extend([0x10; 64]);
+    let sof = if matches!(layout, Layout::Progressive) { 0xc2 } else { 0xc0 };
+    let [w_hi, w_lo] = (8 * BLOCKS).to_be_bytes();
+    data.extend([
+        0xff,
+        sof,
+        0x00,
+        8 + 3 * components,
+        0x08,
+        0x00,
+        0x08,
+        w_hi,
+        w_lo,
+        components
+    ]);
+    for id in 1..=components {
+        data.extend([id, 0x11, 0x00]);
+    }
+    // DC table: one symbol (size 0), code `0`
+    data.extend([0xff, 0xc4, 0x00, 0x14, 0x00, 0x01]);
+    data.extend([0x00; 16]);
+    // AC table: EOB, the last run/size, run 11 size 1 and ZRL, each `code_len` bits
+    let mut counts = [0u8; 16];
+    counts[usize::from(code_len) - 1] = 4;
+    data.extend([0xff, 0xc4, 0x00, 0x17, 0x10]);
+    data.extend(counts);
+    data.extend([0x00, last_run_and_size, 0xb1, 0xf0]);
+
+    let ac = |bits: &mut Bits, symbol: u32| bits.put(symbol, code_len);
+    let overrun = |bits: &mut Bits| {
+        for _ in 0..3 {
+            ac(bits, ZRL);
+        }
+        ac(bits, RUN_11);
+        bits.put(1, 1);
+        ac(bits, LAST);
+        bits.put(1, 1);
+    };
+    let sos = |data: &mut Vec<u8>, ids: &[u8], ss: u8, se: u8| {
+        let n = ids.len() as u8;
+        data.extend([0xff, 0xda, 0x00, 6 + 2 * n, n]);
+        for &id in ids {
+            data.extend([id, 0x00]);
+        }
+        data.extend([ss, se, 0x00]);
+    };
+    let mut bits = Bits::new();
+    match layout {
+        Layout::Baseline | Layout::BaselineSkipped => {
+            let ids: Vec<u8> = (1..=components).collect();
+            sos(&mut data, &ids, 0, 63);
+            for block in 0..BLOCKS {
+                for &id in &ids {
+                    bits.put(0, 1); // DC 0
+                    if block == 0 && id == overrun_id {
+                        overrun(&mut bits);
+                    } else {
+                        ac(&mut bits, EOB);
+                    }
+                }
+            }
+        }
+        Layout::Progressive => {
+            sos(&mut data, &[1], 0, 0);
+            let mut dc = Bits::new();
+            for _ in 0..BLOCKS {
+                dc.put(0, 1); // DC 0
+            }
+            data.extend(dc.finish());
+            sos(&mut data, &[1], 1, 63);
+            overrun(&mut bits);
+            for _ in 1..BLOCKS {
+                ac(&mut bits, EOB);
+            }
+        }
+    }
+    data.extend(bits.finish());
+    data.extend([0xff, 0xd9]);
+    data
+}
+
+fn decode_luma(data: &[u8], strict: bool) -> Result<Vec<u8>, DecodeErrors> {
+    let options = DecoderOptions::default()
+        .set_strict_mode(strict)
+        .jpeg_set_out_colorspace(ColorSpace::Luma);
+    JpegDecoder::new_with_options(ZCursor::new(data), options).decode()
+}
+
+#[test]
+fn ac_run_past_end_of_block() {
+    // A run past the last coefficient is malformed. Lenient decoding puts the coefficient
+    // on the last position, as libjpeg-turbo does, instead of wrapping it onto the DC, so
+    // the stream decodes like the one whose run ends exactly at 63; strict decoding
+    // rejects it. The same must hold on the slow and fast AC paths, when the component is
+    // skipped, and in a progressive AC scan.
+    let mut failures = vec![];
+    for layout in [
+        Layout::Baseline,
+        Layout::BaselineSkipped,
+        Layout::Progressive
+    ] {
+        for code_len in [12, 3] {
+            let case = format!("{layout:?}, {code_len}-bit AC codes");
+            let past = ac_run_past_end(layout, code_len, 0x91);
+            let at_end = ac_run_past_end(layout, code_len, 0x21);
+            match (decode_luma(&past, false), decode_luma(&at_end, false)) {
+                (Ok(a), Ok(b)) if a == b => {}
+                (Ok(_), Ok(_)) => failures.push(format!("{case}: lenient: pixels differ")),
+                (a, b) => failures.push(format!("{case}: lenient: {:?} / {:?}", a.err(), b.err()))
+            }
+            if let Err(e) = decode_luma(&at_end, true) {
+                failures.push(format!(
+                    "{case}: strict rejected a run that ends at 63: {e:?}"
+                ));
+            }
+            match decode_luma(&past, true) {
+                Err(DecodeErrors::FormatStatic(m)) if m.contains("past the end") => {}
+                Err(e) => failures.push(format!("{case}: strict: {e:?}")),
+                Ok(_) => failures.push(format!("{case}: strict: accepted"))
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
 
 #[test]
 fn test_panic_on_slice() {

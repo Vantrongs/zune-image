@@ -31,17 +31,17 @@ use crate::errors::HdrDecodeErrors;
 ///
 /// For sophisticated algorithms, they may use the metadata to further understand the data.
 pub struct HdrDecoder<T: ZByteReaderTrait> {
-    buf:             ZReader<T>,
-    options:         DecoderOptions,
-    metadata:        BTreeMap<String, String>,
-    width:           usize,
-    height:          usize,
-    decoded_headers: bool
+    buf: ZReader<T>,
+    options: DecoderOptions,
+    metadata: BTreeMap<String, String>,
+    width: usize,
+    height: usize,
+    decoded_headers: bool,
 }
 
 impl<T> HdrDecoder<T>
 where
-    T: ZByteReaderTrait
+    T: ZByteReaderTrait,
 {
     /// Create a new HDR decoder
     ///
@@ -94,7 +94,7 @@ where
             width: 0,
             height: 0,
             metadata: BTreeMap::new(),
-            decoded_headers: false
+            decoded_headers: false,
         }
     }
     /// Get key value metadata found in the header
@@ -183,7 +183,7 @@ where
             (_, _) => {
                 return Err(HdrDecodeErrors::UnsupportedOrientation(
                     first_type,
-                    second_type
+                    second_type,
                 ));
             }
         }
@@ -191,7 +191,7 @@ where
             return Err(HdrDecodeErrors::TooLargeDimensions(
                 "height",
                 self.options.max_height(),
-                self.height
+                self.height,
             ));
         }
 
@@ -199,7 +199,7 @@ where
             return Err(HdrDecodeErrors::TooLargeDimensions(
                 "width",
                 self.options.max_width(),
-                self.width
+                self.width,
             ));
         }
 
@@ -244,7 +244,7 @@ where
     /// # Returns
     /// - `Ok(Vec<f32>)`: The actual decoded coefficients
     /// - `Err(HdrDecodeErrors)`: Indicates an unrecoverable
-    ///  error occurred during decoding.
+    ///   error occurred during decoding.
     pub fn decode(&mut self) -> Result<Vec<f32>, HdrDecodeErrors> {
         self.decode_headers()?;
         let mut buffer = vec![0.0f32; self.width * self.height * 3];
@@ -259,7 +259,7 @@ where
     /// # Returns
     ///  - `Some(usize)`: Minimum size for a buffer needed to decode the image
     ///  - `None`: Indicates the image headers were not decoded or
-    /// `width*height*colorspace` calculation  overflows a usize
+    ///    `width*height*colorspace` calculation  overflows a usize
     ///
     pub fn output_buffer_size(&self) -> Option<usize> {
         if self.decoded_headers {
@@ -302,15 +302,20 @@ where
         if buffer.len() < output_size {
             return Err(HdrDecodeErrors::TooSmallOutputArray(
                 output_size,
-                buffer.len()
+                buffer.len(),
             ));
         }
         if self.width == 0 {
-           return Err(HdrDecodeErrors::Generic("Width cannot be 0"));
+            return Err(HdrDecodeErrors::Generic("Width cannot be 0"));
         }
 
         // single width scanline
-        let mut scanline = vec![0_u8; self.width * 4]; // R,G,B,E
+        let mut scanline = vec![
+            0_u8;
+            self.width
+                .checked_mul(4)
+                .ok_or(HdrDecodeErrors::Generic("Width too large"))?
+        ]; // R,G,B,E
 
         let output_scanline_size = self.width * 3; // RGB, * width gives us size of one scanline
 
@@ -325,7 +330,7 @@ where
                 continue;
             }
 
-            let mut i = self.buf.read_u8();
+            let mut i = self.buf.read_u8_err()?;
 
             if i != 2 {
                 // undo byte read
@@ -394,7 +399,7 @@ where
     }
 
     fn decompress(
-        &mut self, scanline: &mut [u8], mut width: i32, mut scanline_offset: usize
+        &mut self, scanline: &mut [u8], mut width: i32, mut scanline_offset: usize,
     ) -> Result<(), HdrDecodeErrors> {
         let mut shift = 0;
 
@@ -438,7 +443,7 @@ where
     /// This will write to `write_to` appropriately
     /// resizing the buffer in case the line spans a great length
     fn get_buffer_until(
-        &mut self, needle: u8, write_to: &mut Vec<u8>
+        &mut self, needle: u8, write_to: &mut Vec<u8>,
     ) -> Result<usize, HdrDecodeErrors> {
         write_to.clear();
         let start = self.buf.position()?;
@@ -490,21 +495,6 @@ fn ldexp_neg(x: f32, exp: u32) -> f32 {
     let pow = 1_u32.wrapping_shl(exp) as f32;
     x / pow
 }
-/// Fast calculation of  x*(2^exp).
-///
-/// exp is assumed to be integer
-// #[inline]
-// fn ldxep(x: f32, exp: i32) -> f32 {
-//     let pow = (1_i32 << (exp.abs() & 31)) as f32;
-//     if exp.is_negative() {
-//         // if negative 2 ^ exp is the same as 1 / (1<<exp.abs()) since
-//         // 2^(-exp) is sexpressed as 1/(2^exp)
-//         x / pow
-//     } else {
-//         // 2^exp is same as 1<<exp, but latter is way faster
-//         x * pow
-//     }
-// }
 
 #[inline]
 fn convert_pos(val: i32, exponent: i32) -> f32 {

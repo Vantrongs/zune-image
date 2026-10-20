@@ -92,6 +92,11 @@
     "comment": "Down sampled progressive image with only grayscale component"
   },
   {
+    "name": "progressive_dc_huffman_table_1.jpg",
+    "hash": 174920954580235010517398776891831906725,
+    "comment": "Progressive non-interleaved scan selecting DC Huffman table 1; from image-rs/image tests/images/jpg/progressive/3.jpg"
+  },
+  {
     "name": "weird_sampling_2.jpeg",
     "hash": 153334696196554300891417361546372006533,
     "comment": "Y and Cb not sub-sampled, Cr sub-sampled, jxl effect"
@@ -122,7 +127,52 @@
     "hash": 109677255988131284084676849366241145140,
     "comment": "SOS interleaved with markers"
   },
-  {"name": "synthetic_image.jpg",
-  "hash": 227404429493772307321352105035704751995,
-  "comment": "Tripped up MCU decoding, see https://github.com/etemesi254/zune-image/pull/346"}
+  {
+    "name": "synthetic_image.jpg",
+    "hash": 227404429493772307321352105035704751995,
+    "comment": "Tripped up MCU decoding, see https://github.com/etemesi254/zune-image/pull/346"
+  },
+  {
+    "name": "weird_sampling_3.jpg",
+    "hash": 26455814955148065345062877821233328526,
+    "comment": "First two components 4x2 subsampled, last not subsampled"
+  },
+  {
+    "name": "arith/seq.jpg",
+    "hash": 308699570423173762598813957121638158295
+  },
+  {
+    "name": "arith/seq-restart.jpg",
+    "hash": 308699570423173762598813957121638158295
+  },
+  {
+    "name": "arith/seq-restart-block.jpg",
+    "hash": 308699570423173762598813957121638158295
+  },
+  {
+    "name": "arith/prog.jpg",
+    "hash": 308699570423173762598813957121638158295
+  },
+  {
+    "name": "arith/prog-restart.jpg",
+    "hash": 308699570423173762598813957121638158295
+  },
+  {
+    "name": "noninterleaved-dc-table-1-17x19.jpg",
+    "hash": 260187211213493560908542562379946200200,
+    "colorspace": "rgb",
+    "comment": "Progressive separate DC-first scans using chroma Huffman table 1; authored color grid."
+  },
+  {
+    "name": "noninterleaved-dc-table-2-83x59.jpg",
+    "hash": 274891929724699243682941713076100204759,
+    "colorspace": "rgb",
+    "comment": "Progressive separate DC-first scans using chroma Huffman table 2; authored color grid."
+  },
+  {
+    "name": "noninterleaved-dc-table-3-160x120.jpg",
+    "hash": 338905096724338343787526504398364891758,
+    "colorspace": "rgb",
+    "comment": "Progressive separate DC-first scans using chroma Huffman table 3; authored color grid."
+  }
 ]

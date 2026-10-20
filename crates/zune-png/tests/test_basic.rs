@@ -11,6 +11,7 @@ use std::io::Cursor;
 use std::path::Path;
 
 use zune_core::bytestream::ZCursor;
+use zune_core::result::DecodingResult;
 
 fn open_and_read<P: AsRef<Path>>(path: P) -> Vec<u8> {
     read(path).unwrap()
@@ -46,19 +47,44 @@ fn test_decoding<P: AsRef<Path>>(path: P) {
 }
 
 #[test]
-fn test_1bpp_basic() {
-    // let path = "/home/caleb/Downloads/1603452522445567021368131.png"; //env!("CARGO_MANIFEST_DIR").to_string() + "/tests/png_suite/basn0g01.png";
-    //
-    // let contents = open_and_read(path);
-    // let mut decoder = zune_png::PngDecoder::new(&contents);
-    //
-    // decoder.decode_headers().unwrap();
-    // while decoder.more_frames()
-    // {
-    //     println!("{:?}", decoder.get_depth());
-    //     let bytes = decoder.decode().unwrap().u8().unwrap();
-    //     println!("{:?}", &bytes[0..10]);
-    // }
+fn test_16bpp_to_8bpp_interlaced() {
+    let path = env!("CARGO_MANIFEST_DIR").to_string() + "/tests/png_suite/bgai4a16.png";
+
+    let contents = open_and_read(path);
+    let opt = zune_core::options::DecoderOptions::new_fast().png_set_strip_to_8bit(true);
+    let mut decoder = zune_png::PngDecoder::new_with_options(ZCursor::new(&contents), opt);
+    let normal_decode = zune_png::PngDecoder::new(ZCursor::new(&contents))
+        .decode()
+        .unwrap();
+
+    let strip_decode = decoder.decode().unwrap().u8().unwrap();
+    if let DecodingResult::U16(new) = normal_decode {
+        for (pos, (a, b)) in new.iter().zip(strip_decode).enumerate() {
+            if (a >> 8) as u8 != b {
+                panic!("{pos}= ({:?} != {:?})", (a >> 8), b);
+            }
+        }
+    }
+}
+#[test]
+fn test_16bpp_to_8bpp_basic() {
+    let path = env!("CARGO_MANIFEST_DIR").to_string() + "/tests/png_suite/basn6a16.png";
+
+    let contents = open_and_read(path);
+    let opt = zune_core::options::DecoderOptions::new_fast().png_set_strip_to_8bit(true);
+    let mut decoder = zune_png::PngDecoder::new_with_options(ZCursor::new(&contents), opt);
+    let normal_decode = zune_png::PngDecoder::new(ZCursor::new(&contents))
+        .decode()
+        .unwrap();
+
+    let strip_decode = decoder.decode().unwrap().u8().unwrap();
+    if let DecodingResult::U16(new) = normal_decode {
+        for (pos, (a, b)) in new.iter().zip(strip_decode).enumerate() {
+            if (a >> 8) as u8 != b {
+                panic!("{pos}= ({:?} != {:?})", (a >> 8), b);
+            }
+        }
+    }
 }
 
 #[test]
@@ -136,4 +162,32 @@ fn test_basn6a16() {
     let path = env!("CARGO_MANIFEST_DIR").to_string() + "/tests/png_suite/basn6a16.png";
 
     test_decoding(path);
+}
+
+#[test]
+fn test_idat_split_into_one_byte_chunks() {
+    // The zlib header itself is split across two IDAT chunks
+    for name in ["oi9n0g16.png", "oi9n2c16.png"] {
+        let path = env!("CARGO_MANIFEST_DIR").to_string() + "/tests/png_suite/" + name;
+
+        test_decoding(path);
+    }
+}
+
+#[test]
+fn test_interlaced_last_pixel_in_image() {
+    // Images where an Adam7 pass ends less than one pass stride before the end of the image
+    for name in [
+        "s01i3p01.png",
+        "s02i3p01.png",
+        "s03i3p01.png",
+        "s05i3p02.png",
+        "s09i3p02.png",
+        "s33i3p04.png",
+        "s39i3p04.png",
+    ] {
+        let path = env!("CARGO_MANIFEST_DIR").to_string() + "/tests/png_suite/" + name;
+
+        test_decoding(path);
+    }
 }

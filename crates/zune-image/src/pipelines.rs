@@ -7,8 +7,7 @@
 //!
 #![allow(unused_variables)]
 use std::time::Instant;
-
-use zune_core::log::Level::Trace;
+use zune_core::log;
 use zune_core::log::{log_enabled, trace};
 
 use crate::codecs::ImageFormat;
@@ -27,7 +26,7 @@ enum PipelineState {
     /// The pipeline is ready to carry out image encoding
     Encode,
     /// The pipeline is done.
-    Finished
+    Finished,
 }
 
 impl PipelineState {
@@ -37,7 +36,7 @@ impl PipelineState {
             PipelineState::Decode => Some(PipelineState::Operations),
             PipelineState::Operations => Some(PipelineState::Encode),
             PipelineState::Encode => Some(PipelineState::Finished),
-            PipelineState::Finished => None
+            PipelineState::Finished => None,
         }
     }
 }
@@ -47,7 +46,7 @@ impl PipelineState {
 /// It contains the image format the data is in
 pub struct EncodeResult {
     pub(crate) format: ImageFormat,
-    pub(crate) data:   Vec<u8>
+    pub(crate) data: Vec<u8>,
 }
 
 impl EncodeResult {
@@ -73,10 +72,10 @@ impl EncodeResult {
 /// via  [`images`](crate::pipelines::Pipeline::images) and
 ///  [`images_mut`](crate::pipelines::Pipeline::images_mut)
 pub struct Pipeline {
-    state:      Option<PipelineState>,
-    decode:     Option<Box<dyn IntoImage>>,
-    image:      Vec<Image>,
-    operations: Vec<Box<dyn OperationsTrait>>
+    state: Option<PipelineState>,
+    decoders: Vec<Box<dyn IntoImage>>,
+    image: Vec<Image>,
+    operations: Vec<Box<dyn OperationsTrait>>,
 }
 
 impl Pipeline {
@@ -84,10 +83,10 @@ impl Pipeline {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Pipeline {
         Pipeline {
-            image:      vec![],
-            state:      Some(PipelineState::Initialized),
-            decode:     None,
-            operations: vec![]
+            image: vec![],
+            state: Some(PipelineState::Initialized),
+            decoders: vec![],
+            operations: vec![],
         }
     }
 
@@ -96,13 +95,12 @@ impl Pipeline {
         self.image.push(image);
     }
 
-    /// Override the decoder present in the pipeline with a different
-    /// decoder.
+    /// Add a decoder to the pipeline queue.
     ///
-    /// There can only be one decoder in a pipeline, so the last decoder
-    /// is the one that will be considered.
+    /// You can chain multiple decoders to load multiple images into the pipeline
+    /// before operations are run.
     pub fn chain_decoder(&mut self, decoder: Box<dyn IntoImage>) -> &mut Pipeline {
-        self.decode = Some(decoder);
+        self.decoders.push(decoder);
         self
     }
     /// Add a new operation to the workflow.
@@ -112,9 +110,9 @@ impl Pipeline {
     ///
     /// # Example
     /// - This operation will decode a jpeg image pointed by buf,
-    /// which is added to the workflow via add_buffer, then
+    ///   which is added to the workflow via add_buffer, then
     /// 1. It de-interleaves the image channels, separating them into
-    /// separate RGB channels
+    ///    separate RGB channels
     /// 2. Convert RGB data to grayscale
     /// 3. Change the depth to be float32 (f32 in range 0..2)
     /// ```no_run
@@ -157,72 +155,74 @@ impl Pipeline {
             match state {
                 PipelineState::Decode => {
                     let start = Instant::now();
-                    // do the actual decode
-                    if self.decode.is_none() {
-                        // we have an image, no need to decode a new one
+
+                    // If no decoders are queued
+                    if self.decoders.is_empty() {
                         if self.image.is_empty() {
-                            trace!("Image already present, no need to decode");
-                            // move to the next state
-                            self.state = state.next();
-
-                            return Ok(());
+                            return Err(ImageErrors::NoImageForOperations);
                         }
-                        return Err(ImageErrors::NoImageForOperations);
+                        trace!("Image already present, no need to decode");
+                    } else {
+                        if log_enabled!(log::Level::Trace) {
+                            println!();
+                            trace!("Current state: {:?}\n", state);
+                        }
+
+                        //  Drain and process ALL queued decoders
+                        for mut decode_op in self.decoders.drain(..) {
+                            if log_enabled!(log::Level::Trace) {
+                                println!();
+                            }
+                            let img = decode_op.into_image()?;
+                            self.image.push(img);
+                            if log_enabled!(log::Level::Trace) {
+                                println!();
+                            }
+                        }
+
+                        let stop = Instant::now();
+                        trace!("Finished decoding in {} ms", (stop - start).as_millis());
                     }
 
-                    if log_enabled!(Trace) {
-                        println!();
-                        trace!("Current state: {:?}\n", state);
-                    }
-
-                    let mut decode_op = self.decode.take().unwrap();
-
-                    let img = decode_op.into_image()?;
-
-                    self.image.push(img);
-
-                    let stop = Instant::now();
-
+                    // Advance state once after all decodes
                     self.state = state.next();
-
-                    trace!("Finished decoding in {} ms", (stop - start).as_millis());
                 }
+
                 PipelineState::Operations => {
                     if self.image.is_empty() {
                         return Err(ImageErrors::NoImageForOperations);
                     }
 
-                    if log_enabled!(Trace) && !self.operations.is_empty() {
+                    if log_enabled!(log::Level::Trace) && !self.operations.is_empty() {
                         println!();
                         trace!("Current state: {:?}\n", state);
                     }
 
-                    for image in self.image.iter_mut() {
-                        for operation in &self.operations {
-                            let operation_name = operation.name();
+                    for operation in &self.operations {
+                        let operation_name = operation.name();
+                        trace!("Running {}", operation_name);
 
-                            trace!("Running {}", operation_name);
+                        let start = Instant::now();
+                        operation.execute_multiple(&mut self.image)?;
+                        let stop = Instant::now();
 
-                            let start = Instant::now();
+                        trace!(
+                            "Finished running `{operation_name}` in {} ms",
+                            (stop - start).as_millis()
+                        );
 
-                            operation.execute(image)?;
-
-                            let stop = Instant::now();
-
-                            trace!(
-                                "Finished running `{operation_name}` in {} ms",
-                                (stop - start).as_millis()
-                            );
-                        }
-                        self.state = state.next();
+                        if let Some(output) = operation.printable_result() {
+                            eprintln!("[{}] {}", operation_name, output);                        }
                     }
-                }
-                PipelineState::Finished => {
-                    trace!("Finished operations for this workflow");
 
                     self.state = state.next();
-                    return Ok(());
                 }
+
+                PipelineState::Finished => {
+                    trace!("Finished operations for this workflow");
+                    self.state = state.next();
+                }
+
                 _ => {
                     self.state = state.next();
                 }

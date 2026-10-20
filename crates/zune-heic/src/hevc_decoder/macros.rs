@@ -1,0 +1,64 @@
+/// A lightweight debug printing macro controlled by `DEBUG_MORE`.
+///
+/// This macro behaves like [`println!`] but only emits output when
+/// `DEBUG_MORE` is `true`. It also prepends the file and line number
+/// to each message for easier tracing.
+///
+/// # Features
+///
+/// - Accepts full `println!`-style formatting
+/// - Optional conditional printing per call
+/// - Includes `file!()` and `line!()` automatically
+/// - Zero-cost when `DEBUG_MORE` is `false` (optimized out in release if const)
+///
+/// # Output Format
+///
+/// ```text
+/// [src/main.rs:10] value = 42
+/// ```
+///
+/// # Notes
+///
+/// - Requires a `DEBUG_MORE: bool` in scope
+/// - Prefer `const DEBUG_MORE: bool = false;` for zero-cost in release builds
+///
+macro_rules! debug_more {
+    ($cond:expr => $($arg:tt)*) => {
+        if DEBUG_MORE && $cond {
+            $crate::dbg_println!("{}", format_args!($($arg)*));
+        }
+    };
+    ($($arg:tt)*) => {
+        if DEBUG_MORE {
+            $crate::dbg_println!("{}", format_args!($($arg)*));
+        }
+    };
+}
+
+/// `println!` for debug tracing; compiled out (arguments still type-checked)
+/// without the `std` feature.
+macro_rules! dbg_println {
+    () => {{
+        #[cfg(feature = "std")]
+        ::std::println!();
+    }};
+    ($($arg:tt)*) => {{
+        #[cfg(feature = "std")]
+        ::std::println!($($arg)*);
+        #[cfg(not(feature = "std"))]
+        let _ = format_args!($($arg)*);
+    }};
+}
+
+/// `print!` for debug tracing; compiled out without the `std` feature.
+macro_rules! dbg_print {
+    ($($arg:tt)*) => {{
+        #[cfg(feature = "std")]
+        ::std::print!($($arg)*);
+        #[cfg(not(feature = "std"))]
+        let _ = format_args!($($arg)*);
+    }};
+}
+
+// crate-private, reachable as `crate::debug_more!` etc. (see lib.rs)
+pub(crate) use {dbg_print, dbg_println, debug_more};

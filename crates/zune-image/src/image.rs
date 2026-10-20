@@ -18,11 +18,12 @@ use zune_core::bit_depth::BitDepth;
 use zune_core::colorspace::ColorSpace;
 
 use crate::channel::{Channel, ChannelErrors};
+use crate::colors::Color;
 use crate::core_filters::colorspace::ColorspaceConv;
 use crate::core_filters::depth::Depth;
 use crate::deinterleave::{deinterleave_f32, deinterleave_u16, deinterleave_u8};
 use crate::errors::ImageErrors;
-use crate::frame::Frame;
+use crate::frame::{Endianness, Frame};
 use crate::metadata::ImageMetadata;
 use crate::traits::{OperationsTrait, ZuneInts};
 
@@ -32,8 +33,11 @@ pub const MAX_CHANNELS: usize = 4;
 /// Represents a single image
 #[derive(Clone)]
 pub struct Image {
-    pub(crate) frames:   Vec<Frame>,
-    pub(crate) metadata: ImageMetadata
+    // background color to use for operations, set as white
+    // for default
+    pub(crate) background_color: Color,
+    pub(crate) frames: Vec<Frame>,
+    pub(crate) metadata: ImageMetadata,
 }
 
 impl PartialEq<Self> for Image {
@@ -51,7 +55,7 @@ impl Image {
     ///  
     pub fn new(
         channels: Vec<Channel>, depth: BitDepth, width: usize, height: usize,
-        colorspace: ColorSpace
+        colorspace: ColorSpace,
     ) -> Image {
         // setup metadata information
         let mut meta = ImageMetadata::default();
@@ -61,13 +65,14 @@ impl Image {
         meta.set_colorspace(colorspace);
 
         Image {
-            frames:   vec![Frame::new(channels)],
-            metadata: meta
+            frames: vec![Frame::new(channels)],
+            background_color: Color::white(),
+            metadata: meta,
         }
     }
     /// Create an image from multiple frames.
     pub fn new_frames(
-        frames: Vec<Frame>, depth: BitDepth, width: usize, height: usize, colorspace: ColorSpace
+        frames: Vec<Frame>, depth: BitDepth, width: usize, height: usize, colorspace: ColorSpace,
     ) -> Image {
         // setup metadata information
         let mut meta = ImageMetadata::default();
@@ -78,7 +83,8 @@ impl Image {
 
         Image {
             frames,
-            metadata: meta
+            metadata: meta,
+            background_color: Color::white(),
         }
     }
 
@@ -96,6 +102,14 @@ impl Image {
     /// Get image dimensions as a tuple of (width,height)
     pub const fn dimensions(&self) -> (usize, usize) {
         self.metadata.dimensions()
+    }
+    /// Get image width
+    pub const fn width(&self) -> usize {
+        self.metadata.dimensions().0
+    }
+    /// Get image height
+    pub const fn height(&self) -> usize {
+        self.metadata.dimensions().1
     }
 
     /// Get the image depth of this image
@@ -122,7 +136,7 @@ impl Image {
     pub fn metadata_mut(&mut self) -> &mut ImageMetadata {
         &mut self.metadata
     }
-
+    
     /// Return an immutable reference to all image frames
     ///
     /// # Returns
@@ -188,13 +202,35 @@ impl Image {
         } else if self.metadata.depth() == BitDepth::Sixteen {
             self.frames_ref()
                 .iter()
-                .map(|z| z.u16_to_native_endian())
+                .map(|z| z.u16_to_u8_endian(Endianness::Native).unwrap())
                 .collect()
         } else {
             todo!("Unimplemented")
         }
     }
-    /// Convert the images to
+    /// Flatten every channel of every frame into a `Vec<Vec<u8>>`.
+    ///
+    /// Each inner `Vec<u8>` corresponds to one channel (in channel order),
+    /// and contains every pixel in that channel laid out in row-major order.
+    ///
+    /// If the image is already 8-bit the channel data is copied directly.
+    /// Otherwise the image is cloned and converted to 8-bit before flattening;
+    /// the original image is left unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal depth conversion fails.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use zune_core::colorspace::ColorSpace;
+    /// use zune_image::image::Image;
+    ///
+    /// let image = Image::from_u8(&[0, 128, 255], 3, 1, ColorSpace::Luma);
+    /// let channels = image.flatten_to_u8();
+    /// assert_eq!(channels[0], vec![0, 128, 255]);
+    /// ```
     pub fn flatten_to_u8(&self) -> Vec<Vec<u8>> {
         if self.depth() == BitDepth::Eight {
             self.flatten_frames::<u8>()
@@ -204,15 +240,50 @@ impl Image {
             im_clone.flatten_frames::<u8>()
         }
     }
+    /// Flatten every channel of every frame into a `Vec<Vec<u16>>`.
+    ///
+    /// Each inner `Vec<u16>` corresponds to one channel (in channel order),
+    /// and contains every pixel in that channel laid out in row-major order.
+    ///
+    /// If the image is already 16-bit the channel data is copied directly.
+    /// Otherwise the image is cloned and converted to 16-bit before flattening;
+    /// the original image is left unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal depth conversion fails.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use zune_core::colorspace::ColorSpace;
+    /// use zune_image::image::Image;
+    ///
+    /// let image = Image::from_u8(&[0, 128, 255], 3, 1, ColorSpace::Luma);
+    /// let channels = image.flatten_to_u16();
+    /// // values are scaled from 8-bit to 16-bit
+    /// assert_eq!(channels[0][0], 0);
+    /// assert_eq!(channels[0][2], 65535);
+    /// ```
+    pub fn flatten_to_u16(&self) -> Vec<Vec<u16>> {
+        if self.depth() == BitDepth::Sixteen {
+            self.flatten_frames::<u16>()
+        } else {
+            let mut im_clone = self.clone();
+            Depth::new(BitDepth::Sixteen)
+                .execute(&mut im_clone)
+                .unwrap();
+            im_clone.flatten_frames::<u16>()
+        }
+    }
     #[allow(dead_code)]
     pub(crate) fn to_u8_be(&self) -> Vec<Vec<u8>> {
-        let colorspace = self.colorspace();
         if self.metadata.depth() == BitDepth::Eight {
             self.flatten_frames::<u8>()
         } else if self.metadata.depth() == BitDepth::Sixteen {
             self.frames_ref()
                 .iter()
-                .map(|z| z.u16_to_big_endian(colorspace))
+                .map(|z| z.u16_to_u8_endian(Endianness::Big).unwrap())
                 .collect()
         } else {
             todo!("Unimplemented")
@@ -264,7 +335,7 @@ impl Image {
     ///
     pub fn fill<T>(pixel: T, colorspace: ColorSpace, width: usize, height: usize) -> Image
     where
-        T: Copy + Clone + 'static + ZuneInts<T> + Zeroable + Pod
+        T: Copy + Clone + 'static + ZuneInts<T> + Zeroable + Pod,
     {
         let dims = width * height;
 
@@ -284,11 +355,11 @@ impl Image {
     ///  - height: The height of the new image
     ///  - colorspace: The new colorspace of the image
     ///  - func: A function which will be called for every pixel position
-    ///   the function is supposed to return pixels for that position
+    ///    the function is supposed to return pixels for that position
     ///      - y: The position in the y-axis, starts at 0, ends at image height
     ///      - x: The position in the x-axis, starts at 0, ends at image width
     ///      - pixels: A mutable region where you can write pixels to. The results
-    ///         will be copied to the pixel positions at pixel x,y for image channels
+    ///        will be copied to the pixel positions at pixel x,y for image channels
     ///     
     /// # Limitations.
     ///
@@ -319,14 +390,14 @@ impl Image {
     pub fn from_fn<T, F>(width: usize, height: usize, colorspace: ColorSpace, func: F) -> Image
     where
         F: Fn(usize, usize, &mut [T; MAX_CHANNELS]),
-        T: ZuneInts<T> + Copy + Clone + 'static + Default + Debug + Zeroable + Pod
+        T: ZuneInts<T> + Copy + Clone + 'static + Default + Debug + Zeroable + Pod,
     {
         match colorspace.num_components() {
             1 => Image::from_fn_inner::<_, _, 1>(width, height, func, colorspace),
             2 => Image::from_fn_inner::<_, _, 2>(width, height, func, colorspace),
             3 => Image::from_fn_inner::<_, _, 3>(width, height, func, colorspace),
             4 => Image::from_fn_inner::<_, _, 4>(width, height, func, colorspace),
-            _ => unreachable!()
+            _ => unreachable!(),
         }
     }
 
@@ -336,11 +407,11 @@ impl Image {
     /// This allows further optimizations by the compiler
     /// like removing bounds check in the inner loop
     fn from_fn_inner<F, T, const COMPONENTS: usize>(
-        width: usize, height: usize, func: F, colorspace: ColorSpace
+        width: usize, height: usize, func: F, colorspace: ColorSpace,
     ) -> Image
     where
         F: Fn(usize, usize, &mut [T; MAX_CHANNELS]),
-        T: ZuneInts<T> + Copy + Clone + 'static + Default + Debug + Zeroable + Pod
+        T: ZuneInts<T> + Copy + Clone + 'static + Default + Debug + Zeroable + Pod,
     {
         let size = width * height * T::depth().size_of();
 
@@ -378,6 +449,12 @@ impl Image {
 
         Image::new(channels, T::depth(), width, height, colorspace)
     }
+    pub fn background_color(&self) -> Color {
+        self.background_color
+    }
+    pub fn set_background_color(&mut self, color: Color) {
+        self.background_color = color;
+    }
 }
 
 /// Pixel constructors
@@ -397,7 +474,7 @@ impl Image {
     ///
     /// # Panics
     /// - In case calculating image dimensions overflows a [`usize`]
-    /// this indicates that the array cannot be indexed by usize,hence values are invalid
+    ///   this indicates that the array cannot be indexed by usize,hence values are invalid
     ///
     /// - If the length of pixels doesn't match the expected length
     pub fn from_u8(pixels: &[u8], width: usize, height: usize, colorspace: ColorSpace) -> Image {
@@ -489,14 +566,14 @@ impl Image {
     ///
     /// # Arguments
     /// - func: Function which will modify the pixels
-    ///     The arguments used are
+    ///   The arguments used are
     ///     - `y: usize`, the current position of the height we are currently in
     ///     - `x: usize`, the current position on the x axis we are in
     ///     - `[&mut T;MAX_CHANNELS]`, the pixels at `[y,x]` from the channels which
-    ///        can be modified.
-    ///        Even though it returns `MAX_CHANNELS`, only the image colorspace components
-    ///        considered, so for Luma colorspace, we only use the first element in the array and the rest are
-    ///         ignored
+    ///       can be modified.
+    ///       Even though it returns `MAX_CHANNELS`, only the image colorspace components
+    ///       considered, so for Luma colorspace, we only use the first element in the array and the rest are
+    ///       ignored
     ///
     /// # Returns
     ///  - Ok(()): Successful manipulation of image
@@ -526,7 +603,7 @@ impl Image {
     pub fn modify_pixels_mut<T, F>(&mut self, func: F) -> Result<(), ChannelErrors>
     where
         T: ZuneInts<T> + Default + Copy + 'static + Pod,
-        F: Fn(usize, usize, [&mut T; MAX_CHANNELS])
+        F: Fn(usize, usize, [&mut T; MAX_CHANNELS]),
     {
         let colorspace = self.colorspace();
 
@@ -550,11 +627,49 @@ impl Image {
                         &mut T::default(),
                         &mut T::default(),
                         &mut T::default(),
-                        &mut T::default()
+                        &mut T::default(),
                     ];
                     // push pixels from channel to temporary output
                     for (i, j) in (pixel_muts.iter_mut()).zip(output.iter_mut()) {
                         *j = &mut i[position]
+                    }
+
+                    (func)(y, x, output);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Iterate over the pixels
+    pub fn iter_pixels<T, F>(&self, func: F) -> Result<(), ChannelErrors>
+    where
+        T: ZuneInts<T> + Default + Copy + 'static + Pod,
+        F: Fn(usize, usize, [T; MAX_CHANNELS]),
+    {
+        let colorspace = self.colorspace();
+
+        let (width, height) = self.dimensions();
+
+        for frame in self.frames.iter() {
+            let mut pixel_muts: Vec<&[T]> = vec![];
+
+            // convert all channels to type T
+            for channel in frame.channels_ref(colorspace, false) {
+                pixel_muts.push(channel.reinterpret_as()?)
+            }
+            for y in 0..height {
+                for x in 0..width {
+                    let position = y * width + x;
+
+                    // This must be kept in sync with
+                    // MAX_CHANNELS, we can't do it another way
+                    // since they are references
+                    let mut output: [T; MAX_CHANNELS] =
+                        [T::default(), T::default(), T::default(), T::default()];
+                    // push pixels from channel to temporary output
+                    for (i, j) in (pixel_muts.iter_mut()).zip(output.iter_mut()) {
+                        *j = i[position]
                     }
 
                     (func)(y, x, output);
@@ -585,7 +700,7 @@ impl Image {
 }
 
 pub(crate) fn checked_mul(
-    width: usize, height: usize, depth: usize, colorspace_components: usize
+    width: usize, height: usize, depth: usize, colorspace_components: usize,
 ) -> usize {
     width
         .checked_mul(height)
@@ -600,10 +715,11 @@ pub(crate) fn checked_mul(
 mod benchmarks {
 
     extern crate test;
-    
+
     #[bench]
     fn bench_flatten_image(b: &mut test::Bencher) {
-        let image = crate::image::Image::fill(0_u8, zune_core::colorspace::ColorSpace::RGB, 2000, 2000);
+        let image =
+            crate::image::Image::fill(0_u8, zune_core::colorspace::ColorSpace::RGB, 2000, 2000);
 
         b.iter(|| {
             let _ = image.flatten_to_u8();

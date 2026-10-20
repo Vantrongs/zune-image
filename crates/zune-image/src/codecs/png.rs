@@ -12,28 +12,28 @@
 //! Represents an png image decoder and encoder
 use std::io::Cursor;
 
-use zune_core::bit_depth::BitDepth;
+use zune_core::bit_depth::{BitDepth, BitType};
 use zune_core::bytestream::{ZByteReaderTrait, ZByteWriterTrait};
-use zune_core::colorspace::ColorSpace;
+use zune_core::colorspace::{ColorCharacteristics, ColorPrimaries, ColorSpace, SingleColorPrimary};
 use zune_core::log::warn;
 use zune_core::options::EncoderOptions;
 use zune_core::result::DecodingResult;
 use zune_png::error::PngDecodeErrors;
 use zune_png::*;
 
-pub use zune_png::PngDecoder;
 use crate::codecs::{create_options_for_encoder, ImageFormat};
 use crate::errors::ImageErrors;
 use crate::errors::ImageErrors::ImageDecodeErrors;
 use crate::errors::ImgEncodeErrors::ImageEncodeErrors;
-use crate::frame::Frame;
+use crate::frame::{Endianness, Frame};
 use crate::image::Image;
 use crate::metadata::ImageMetadata;
 use crate::traits::{DecodeInto, DecoderTrait, EncoderTrait};
+pub use zune_png::PngDecoder;
 
 impl<T> DecoderTrait for PngDecoder<T>
 where
-    T: ZByteReaderTrait
+    T: ZByteReaderTrait,
 {
     fn decode(&mut self) -> Result<Image, ImageErrors> {
         let metadata = self.read_headers()?.unwrap();
@@ -46,40 +46,73 @@ where
             // decode apng frames
             //let mut previous_frame
             let info = self.info().unwrap().clone();
-            // the output, since we know that no frame will be bigger than the width and height, we can
-            // set this up outside of the loop.
-            let mut output = vec![0; info.width * info.height * colorspace.num_components()];
-            let mut output_frames = Vec::new();
-            while self.more_frames() {
-                self.decode_headers()?;
 
-                let mut frame = self.frame_info().unwrap();
-                if frame.dispose_op == DisposeOp::Previous {
-                    // we don't clear our buffer, so output always contains the previous frame
-                    //
-                    // this means that there is no need to store the previous frame and copy it
-                    frame.dispose_op = DisposeOp::None;
-                }
-                let pix = self.decode()?;
-                match pix {
-                    DecodingResult::U8(pix) => {
-                        post_process_image(
-                            &info,
+            // Allocate both the main canvas and the backup canvas
+            let buffer_size = info.width * info.height * colorspace.num_components();
+            let mut output_frames = Vec::new();
+
+            match self.depth().unwrap().bit_type() {
+                BitType::U8 => {
+                    let mut output = vec![0; buffer_size];
+                    let mut apng_ctx = ApngContext::<u8>::new(self.info().unwrap(), colorspace);
+
+                    while self.more_frames() {
+                        self.decode_headers()?;
+
+                        // We clone the frame info because we need to store it as `prev_frame_info` at the end of the loop
+                        let frame = self.frame_info().unwrap();
+
+                        let pix = self.decode_raw()?;
+                        // A default image that is not part of the animation is not a frame
+                        if !frame.is_part_of_seq {
+                            continue;
+                        }
+
+                        // Use the new APNG post-processing function
+                        apng_ctx.process_frame(&frame, &pix, &mut output)?;
+
+                        // Create the frame from the fully composited output
+                        let im_frame = Frame::from_u8(
+                            &output,
                             colorspace,
-                            &frame,
-                            &pix,
-                            None,
-                            &mut output,
-                            None,
-                        )?;
-                        let duration = f64::from(frame.delay_num) / f64::from(frame.delay_denom);
-                        // then build a frame from that
-                        let im_frame = Frame::from_u8(&output, colorspace, usize::from(frame.delay_num),usize::from(frame.delay_denom));
+                            usize::from(frame.delay_num),
+                            usize::from(frame.delay_denom),
+                        );
                         output_frames.push(im_frame);
                     }
-                    _ => return Err(ImageDecodeErrors("The current image is an  Animated PNG but has a depth of 16, such an image isn't supported".to_string()))
                 }
+                BitType::U16 => {
+                    let mut output = vec![0; buffer_size];
+
+                    let mut apng_ctx = ApngContext::<u16>::new(self.info().unwrap(), colorspace);
+
+                    while self.more_frames() {
+                        self.decode_headers()?;
+
+                        let frame = self.frame_info().unwrap();
+
+                        if let DecodingResult::U16(pix) = self.decode()? {
+                            // A default image that is not part of the animation is not a frame
+                            if !frame.is_part_of_seq {
+                                continue;
+                            }
+                            apng_ctx.process_frame(&frame, &pix, &mut output)?;
+                            // Create the frame from the fully composited output
+                            let im_frame = Frame::from_u16(
+                                &output,
+                                colorspace,
+                                usize::from(frame.delay_num),
+                                usize::from(frame.delay_denom),
+                            );
+                            output_frames.push(im_frame);
+                        } else {
+                            unreachable!("Invalid image state, please report");
+                        }
+                    }
+                }
+                _ => unreachable!(),
             }
+
             let mut image = Image::new_frames(output_frames, depth, width, height, colorspace);
             image.metadata = metadata;
 
@@ -92,7 +125,7 @@ where
             let mut image = match pixels {
                 DecodingResult::U8(data) => Image::from_u8(&data, width, height, colorspace),
                 DecodingResult::U16(data) => Image::from_u16(&data, width, height, colorspace),
-                _ => unreachable!()
+                _ => unreachable!(),
             };
             // metadata
             image.metadata = metadata;
@@ -119,12 +152,49 @@ where
         let (width, height) = self.dimensions().unwrap();
         let depth = self.depth().unwrap();
 
+        let info = self.info().unwrap();
+        // 1. Map the cICP transfer function
+        let transfer_curve = info
+            .cicp_info
+            .as_ref()
+            .map(|cicp| cicp_transfer_characteristics(cicp.transfer_function));
+
+        // 2. Map the cHRM chunk to ColorPrimaries struct
+        let color_primaries = info.chrm_info.as_ref().map(|chrm| ColorPrimaries {
+            red: SingleColorPrimary {
+                x: chrm.red_x as f64 / 100_000.0,
+                y: chrm.red_y as f64 / 100_000.0,
+                z: 0.0,
+            },
+            green: SingleColorPrimary {
+                x: chrm.green_x as f64 / 100_000.0,
+                y: chrm.green_y as f64 / 100_000.0,
+                z: 0.0,
+            },
+            blue: SingleColorPrimary {
+                x: chrm.blue_x as f64 / 100_000.0,
+                y: chrm.blue_y as f64 / 100_000.0,
+                z: 0.0,
+            },
+            white_point: SingleColorPrimary {
+                x: chrm.white_point_x as f64 / 100_000.0,
+                y: chrm.white_point_y as f64 / 100_000.0,
+                z: 0.0,
+            },
+        });
+
+        // 3. Extract the Brightness limits
+        let max_cll = info.clli_info.as_ref().map(|clli| clli.max_cll);
         let mut metadata = ImageMetadata {
             format: Some(ImageFormat::PNG),
             colorspace: self.colorspace().unwrap(),
-            depth: depth,
-            width: width,
-            height: height,
+            depth,
+            width,
+            height,
+            color_trc: transfer_curve,
+            color_primaries,
+            max_cll,
+            color_standard: info.cicp_info.as_ref().map(|c| c.color_primaries),
             default_gamma: self.info().unwrap().gamma,
             ..Default::default()
         };
@@ -145,6 +215,28 @@ where
     }
 }
 
+/// Map a cICP transfer characteristics code point to the transfer function
+/// it names, see Rec. ITU-T H.273, table 3.
+fn cicp_transfer_characteristics(value: u8) -> ColorCharacteristics {
+    match value {
+        // BT.709, BT.601 and BT.2020 (10 and 12 bit) use the same curve
+        1 | 6 | 14 | 15 => ColorCharacteristics::Rec709,
+        4 => ColorCharacteristics::Gamma2p2,
+        5 => ColorCharacteristics::Gamma2p8,
+        7 => ColorCharacteristics::Smpte240,
+        8 => ColorCharacteristics::Linear,
+        9 => ColorCharacteristics::Log100,
+        10 => ColorCharacteristics::Log100Sqrt10,
+        11 => ColorCharacteristics::Iec61966,
+        12 => ColorCharacteristics::Bt1361,
+        13 => ColorCharacteristics::sRGB,
+        16 => ColorCharacteristics::PQ,
+        17 => ColorCharacteristics::Smpte428,
+        18 => ColorCharacteristics::HLG,
+        v => ColorCharacteristics::Unknown(v),
+    }
+}
+
 impl From<zune_png::error::PngDecodeErrors> for ImageErrors {
     fn from(from: zune_png::error::PngDecodeErrors) -> Self {
         let err = format!("png: {from:?}");
@@ -155,7 +247,7 @@ impl From<zune_png::error::PngDecodeErrors> for ImageErrors {
 
 #[derive(Default)]
 pub struct PngEncoder {
-    options: Option<EncoderOptions>
+    options: Option<EncoderOptions>,
 }
 
 impl PngEncoder {
@@ -164,7 +256,7 @@ impl PngEncoder {
     }
     pub fn new_with_options(options: EncoderOptions) -> PngEncoder {
         PngEncoder {
-            options: Some(options)
+            options: Some(options),
         }
     }
 }
@@ -175,13 +267,31 @@ impl EncoderTrait for PngEncoder {
     }
 
     fn encode_inner<T: ZByteWriterTrait>(
-        &mut self, image: &Image, sink: T
+        &mut self, image: &Image, sink: T,
     ) -> Result<usize, ImageErrors> {
         let options = create_options_for_encoder(self.options, image);
 
-        let frame = &image.to_u8_be()[0];
+        let Some(frame) = image.frames_ref().first() else {
+            return Err(ImageErrors::EncodeErrors(ImageEncodeErrors(
+                "No frame".to_string(),
+            )));
+        };
 
-        let mut encoder = zune_png::PngEncoder::new(frame, options);
+        let pixels = match image.depth() {
+            BitDepth::Eight => frame.flatten::<u8>(),
+            BitDepth::Sixteen => {
+                // PNG, big endian
+                frame.u16_to_u8_endian(Endianness::Big)?
+            }
+            d => {
+                return Err(ImageErrors::EncodeErrors(ImageEncodeErrors(format!(
+                    "Unsupported depth {:?}",
+                    d
+                ))))
+            }
+        };
+
+        let mut encoder = zune_png::PngEncoder::new(&pixels, options);
 
         #[allow(unused_mut)]
         let mut buf: Cursor<Vec<u8>> = std::io::Cursor::new(vec![]);
@@ -216,7 +326,7 @@ impl EncoderTrait for PngEncoder {
             ColorSpace::Luma,
             ColorSpace::LumaA,
             ColorSpace::RGB,
-            ColorSpace::RGBA
+            ColorSpace::RGBA,
         ]
     }
 
@@ -231,7 +341,7 @@ impl EncoderTrait for PngEncoder {
     fn default_depth(&self, depth: BitDepth) -> BitDepth {
         match depth {
             BitDepth::Sixteen | BitDepth::Float32 => BitDepth::Sixteen,
-            _ => BitDepth::Eight
+            _ => BitDepth::Eight,
         }
     }
     fn set_options(&mut self, opts: EncoderOptions) {
@@ -241,7 +351,7 @@ impl EncoderTrait for PngEncoder {
 
 impl<T> DecodeInto for PngDecoder<T>
 where
-    T: ZByteReaderTrait
+    T: ZByteReaderTrait,
 {
     type BufferType = u8;
 
@@ -264,13 +374,13 @@ where
 #[cfg(test)]
 mod tests {
     use zune_core::bytestream::ZCursor;
-    use zune_core::colorspace::ColorSpace;
+    use zune_core::colorspace::{ColorCharacteristics, ColorSpace};
     use zune_png::PngDecoder;
 
     use crate::codecs::png::PngEncoder;
     use crate::codecs::ImageFormat;
     use crate::image::Image;
-    use crate::traits::DecodeInto;
+    use crate::traits::{DecodeInto, DecoderTrait};
 
     fn create_png() -> Vec<u8> {
         let encoder = PngEncoder::new();
@@ -283,5 +393,63 @@ mod tests {
         let img = create_png();
         let mut decoder = PngDecoder::new(ZCursor::new(&img));
         decoder.decode_into(&mut output).unwrap();
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = !0_u32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+            }
+        }
+        !crc
+    }
+
+    /// Insert a cICP chunk right after IHDR
+    fn create_png_with_cicp(transfer_characteristics: u8) -> Vec<u8> {
+        let png = create_png();
+        let mut chunk = b"cICP".to_vec();
+        chunk.extend_from_slice(&[1, transfer_characteristics, 0, 1]);
+        let crc = crc32(&chunk);
+
+        // signature (8) + IHDR length, type, data and crc (4 + 4 + 13 + 4)
+        let ihdr_end = 33;
+        let mut out = png[..ihdr_end].to_vec();
+        out.extend_from_slice(&4_u32.to_be_bytes());
+        out.extend_from_slice(&chunk);
+        out.extend_from_slice(&crc.to_be_bytes());
+        out.extend_from_slice(&png[ihdr_end..]);
+        out
+    }
+
+    #[test]
+    fn test_png_cicp_transfer_characteristics() {
+        for (code, expected) in [
+            (1, ColorCharacteristics::Rec709),
+            (4, ColorCharacteristics::Gamma2p2),
+            (13, ColorCharacteristics::sRGB),
+            (16, ColorCharacteristics::PQ),
+            (17, ColorCharacteristics::Smpte428),
+            (2, ColorCharacteristics::Unknown(2))
+        ] {
+            let png = create_png_with_cicp(code);
+            let mut decoder = PngDecoder::new(ZCursor::new(&png));
+            let metadata = DecoderTrait::read_headers(&mut decoder).unwrap().unwrap();
+            assert_eq!(metadata.color_trc(), Some(expected), "cICP transfer {code}");
+        }
+    }
+
+    #[test]
+    fn test_apng_frames() {
+        // acTL num_frames 20, the default image is the first frame
+        let ball = include_bytes!("../../../zune-png/tests/random/animated_ball.png");
+        // acTL num_frames 2, after a separate default image that is not part of the animation
+        let separate_default = include_bytes!("../../../zune-png/tests/random/030.png");
+        for (data, frames) in [(&ball[..], 20), (&separate_default[..], 2)] {
+            let mut decoder = PngDecoder::new(ZCursor::new(data));
+            let image = DecoderTrait::decode(&mut decoder).unwrap();
+            assert_eq!(image.frames_len(), frames);
+        }
     }
 }

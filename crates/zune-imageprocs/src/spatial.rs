@@ -1,30 +1,17 @@
-/*
- * Copyright (c) 2023.
- *
- * This software is free software;
- *
- * You can redistribute it or modify it under terms of the MIT, Apache License or Zlib license
- */
-//! Spatial operations on images
-//!
-//! spatial goes through each pixel on an image collecting its neighbors and picking one
-//! based on the function provided.
-//!
-//! The resulting image is then returned.
-//! The parameter radius corresponds to the radius of the neighbor area to be searched,
-//! for example a radius of R will result in a search window length of 2R+1 for each dimension.
-//!
-//!
+use crate::spatial_ops::{
+    find_contrast, find_gradient, find_max, find_mean, find_min, SpatialOperations,
+};
+use crate::traits::NumOps;
+use std::ops::{Add, Div, Sub};
+use zune_core::bit_depth::BitType;
+use zune_image::errors::ImageErrors;
+use zune_image::image::Image;
+use zune_image::planar_regions::PlanarRegionOut;
+use zune_image::traits::OperationsTrait;
 
-/// Spatial operations on images.
-///
-/// The parameter radius corresponds to the radius of the neighbor area the statistic is applied,
-/// larger radius means more compute time.
-///
-/// for example a radius of R will result in a search window length of 2R+1 for each dimension.
 pub struct SpatialOps {
-    radius:    usize,
-    operation: SpatialOperations
+    radius: usize,
+    operation: SpatialOperations,
 }
 
 impl SpatialOps {
@@ -40,155 +27,138 @@ impl OperationsTrait for SpatialOps {
     }
 
     fn execute_impl(&self, image: &mut Image) -> Result<(), ImageErrors> {
-        let (width, height) = image.dimensions();
-
         let depth = image.depth();
 
-        let spatial_fn = |channel: &mut Channel| -> Result<(), ImageErrors> {
-            let mut new_channel = Channel::new_with_bit_type(channel.len(), depth.bit_type());
+        // Pre-allocate the destination buffer
+        let mut dest_image = image.clone();
+        let ignore_alpha = true;
 
-            match depth.bit_type() {
-                BitType::U16 => spatial_ops(
-                    channel.reinterpret_as::<u16>()?,
-                    new_channel.reinterpret_as_mut::<u16>()?,
-                    self.radius,
-                    width,
-                    height,
-                    self.operation
-                ),
-                BitType::U8 => spatial_ops(
-                    channel.reinterpret_as::<u8>()?,
-                    new_channel.reinterpret_as_mut::<u8>()?,
-                    self.radius,
-                    width,
-                    height,
-                    self.operation
-                ),
-                d => return Err(ImageErrors::ImageOperationNotImplemented(self.name(), d))
+        match depth.bit_type() {
+            BitType::U8 => {
+                image.par_process_regions_out_of_place::<u8, _>(
+                    &mut dest_image,
+                    ignore_alpha,
+                    |region| {
+                        spatial_region(region, self.radius, self.operation);
+                    },
+                )?;
             }
-            *channel = new_channel;
-            Ok(())
-        };
+            BitType::U16 => {
+                image.par_process_regions_out_of_place::<u16, _>(
+                    &mut dest_image,
+                    ignore_alpha,
+                    |region| {
+                        spatial_region(region, self.radius, self.operation);
+                    },
+                )?;
+            }
+            d => return Err(ImageErrors::ImageOperationNotImplemented(self.name(), d)),
+        }
 
-        execute_on(spatial_fn, image, true)
+        *image = dest_image;
+        Ok(())
     }
+
     fn supported_types(&self) -> &'static [BitType] {
         &[BitType::U8, BitType::U16]
     }
 }
-
-use zune_core::bit_depth::BitType;
-use zune_image::channel::Channel;
-use zune_image::errors::ImageErrors;
-use zune_image::image::Image;
-use zune_image::traits::OperationsTrait;
-
-use crate::spatial_ops::{spatial_ops, SpatialOperations};
-use crate::utils::{execute_on, z_prefetch};
-
-/// Go through image neighbord, execute a function on it and return the result
-/// The parameter `function` is the function that receives the list of neighbors and returns the selected
-/// neighbor to be used for the resulting image.
-///
-///
-/// # Arguments
-///
-/// - in_channel: input channel, the width and height are padded with radius*2 edges
-///   (use pad function for that). otherwise this function will panic.
-///
-/// - out_channel: Output channel, the width and height are not padded at all.
-///
-/// - radius: Area to be searched, example a radius of R will result in a search window
-/// length of 2R+1 for each dimension.
-///
-/// - function: Any function that when given an array returns a single element.
-///
-pub fn spatial<T, F>(
-    in_channel: &[T], out_channel: &mut [T], radius: usize, width: usize, height: usize,
-    function: F
+pub fn spatial_region<T>(
+    region: &mut PlanarRegionOut<'_, T>, radius: usize, operations: SpatialOperations,
 ) where
-    T: Default + Copy,
-    F: Fn(&[T]) -> T
+    T: PartialOrd
+    + Default
+    + Copy
+    + NumOps<T>
+    + Sub<Output = T>
+    + Add<Output = T>
+    + Div<Output = T>
+    + Send
+    + Sync,
+    u64: std::convert::From<T>,
 {
-    let old_width = width;
-    let height = (radius * 2) + height;
-    let width = (radius * 2) + width;
+    let width = region.width;
+    if region.src_channels.is_empty() || width == 0 {
+        return;
+    }
 
-    assert_eq!(height * width, in_channel.len());
+    let global_height = region.src_channels[0].len() / width;
 
-    let radius_size = (2 * radius) + 1;
+    let ptr: fn(&[T]) -> T = match operations {
+        SpatialOperations::Contrast => find_contrast::<T>,
+        SpatialOperations::Maximum => find_max::<T>,
+        SpatialOperations::Gradient => find_gradient::<T>,
+        SpatialOperations::Minimum => find_min::<T>,
+        SpatialOperations::Mean => find_mean::<T>,
+    };
 
-    let radius_loop = radius_size >> 1;
+    let diameter = 2 * radius + 1;
+    let neighbourhood_len = diameter * diameter;
+    let mut buf = vec![T::default(); neighbourhood_len];
 
-    let mut local_storage = vec![T::default(); radius_size * radius_size];
+    for (src, dest) in region
+        .src_channels
+        .iter()
+        .zip(region.dest_channels.iter_mut())
+    {
+        for local_y in 0..region.height {
+            let global_y = region.y_offset + local_y;
 
-    for y in radius_loop..height - radius_loop {
-        for x in radius_loop..width - radius_loop {
-            let iy = y - radius_loop;
-            let ix = x - radius_loop;
+            // 1. Initialize the full neighbourhood at the start of the row (x = 0)
+            init_neighbourhood(src, width, global_height, 0, global_y, radius, &mut buf);
+            dest[local_y * width] = ptr(&buf);
 
-            let mut i = 0;
-
-            for ky in 0..radius_size {
-                let iy_i = iy + ky;
-
-                let in_slice = &in_channel[(iy_i * width) + ix..(iy_i * width) + ix + radius_size];
-                z_prefetch(in_channel, (iy_i + 1) * width + ix);
-                local_storage[i..i + radius_size].copy_from_slice(in_slice);
-                z_prefetch(in_channel, (iy_i + 2) * width + ix);
-
-                i += radius_size;
+            // 2. Slide the window for the rest of the row
+            for x in 1..width {
+                slide_neighbourhood(src, width, global_height, x, global_y, radius, &mut buf);
+                dest[local_y * width + x] = ptr(&buf);
             }
-
-            let result = function(&local_storage);
-
-            out_channel[iy * old_width + ix] = result;
         }
     }
 }
 
-/// A special spatial function that takes advantage of const generics to
-/// speed up operations for convolve
-#[allow(non_snake_case)]
-pub(crate) fn spatial_NxN<T, F, const RADIUS: usize, const OUT_SIZE: usize>(
-    in_channel: &[T], out_channel: &mut [T], width: usize, height: usize, function: F
-) where
-    T: Default + Copy,
-    F: Fn(&[T; OUT_SIZE]) -> T
-{
-    let old_width = width;
-    let height = (RADIUS * 2) + height;
-    let width = (RADIUS * 2) + width;
+/// Collect the `(2*radius+1)²` neighbourhood from scratch at `(cx, cy)` into `buf`.
+#[inline(always)]
+fn init_neighbourhood<T: Copy>(
+    src: &[T], width: usize, global_height: usize, cx: usize, cy: usize, radius: usize,
+    buf: &mut [T],
+) {
+    let diameter = 2 * radius + 1;
+    let mut i = 0;
 
-    assert_eq!(height * width, in_channel.len());
+    for ky in 0..diameter {
+        let sy = (cy + ky).saturating_sub(radius).min(global_height - 1);
+        let row_offset = sy * width;
 
-    let radius_size = (2 * RADIUS) + 1;
-
-    let radius_loop = radius_size >> 1;
-
-    let mut local_storage = [T::default(); OUT_SIZE];
-
-    for y in radius_loop..height - radius_loop {
-        for x in radius_loop..width - radius_loop {
-            let iy = y - radius_loop;
-            let ix = x - radius_loop;
-
-            let mut i = 0;
-
-            for ky in 0..radius_size {
-                let iy_i = iy + ky;
-
-                let in_slice = &in_channel[(iy_i * width) + ix..(iy_i * width) + ix + radius_size];
-                z_prefetch(in_channel, (iy_i + 1) * width + ix);
-                local_storage[i..i + radius_size].copy_from_slice(in_slice);
-                z_prefetch(in_channel, (iy_i + 2) * width + ix);
-
-                i += radius_size;
-            }
-
-            let result = function(&local_storage);
-
-            out_channel[iy * old_width + ix] = result;
+        for kx in 0..diameter {
+            let sx = (cx + kx).saturating_sub(radius).min(width - 1);
+            buf[i] = src[row_offset + sx];
+            i += 1;
         }
+    }
+}
+
+/// Slide the `(2*radius+1)²` neighbourhood one pixel to the right.
+/// Discards the leftmost column and fetches the new rightmost column.
+#[inline(always)]
+fn slide_neighbourhood<T: Copy>(
+    src: &[T], width: usize, global_height: usize, cx: usize, cy: usize, radius: usize,
+    buf: &mut [T],
+) {
+    let diameter = 2 * radius + 1;
+
+    // Calculate the x-coordinate of the *new* rightmost column, clamping to the edge.
+    let sx = (cx + radius).min(width - 1);
+
+    for ky in 0..diameter {
+        let sy = (cy + ky).saturating_sub(radius).min(global_height - 1);
+        let row_offset = sy * width;
+        let row_start = ky * diameter;
+
+        // Shift the current row left by 1 pixel (memmove under the hood)
+        buf.copy_within((row_start + 1)..(row_start + diameter), row_start);
+
+        // Insert the newly exposed pixel at the end of the row
+        buf[row_start + diameter - 1] = src[row_offset + sx];
     }
 }

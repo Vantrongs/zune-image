@@ -14,7 +14,7 @@ use zune_core::log::trace;
 use crate::error::PngDecodeErrors;
 
 pub fn default_chunk_handler<T>(
-    length: usize, chunk_type: [u8; 4], reader: &mut ZReader<T>, _crc: u32
+    length: usize, chunk_type: [u8; 4], reader: &mut ZReader<T>,
 ) -> Result<(), PngDecodeErrors>
 where
     T: ZByteReaderTrait
@@ -27,8 +27,8 @@ where
         )));
     }
 
-    trace!("Encountered unknown chunk {:?}", chunk_name);
-    trace!("Length of chunk {}", length);
+    trace!("Encountered unknown chunk {chunk_name:?}");
+    trace!("Length of chunk {length}");
     trace!("Skipping {} bytes", length + 4);
 
     reader.skip(length + 4)?;

@@ -5,18 +5,16 @@
  *
  * You can redistribute it or modify it under terms of the MIT, Apache License or Zlib license
  */
+#![allow(clippy::items_after_statements)]
 
 //! Sobel derivative filter
+use crate::simd_fn;
+use crate::traits::NumOps;
 use zune_core::bit_depth::BitType;
-use zune_image::channel::Channel;
 use zune_image::errors::ImageErrors;
 use zune_image::image::Image;
-use zune_image::traits::OperationsTrait;
-
-use crate::pad::{pad, PadMethod};
-use crate::spatial::spatial_NxN;
-use crate::traits::NumOps;
-use crate::utils::execute_on;
+use zune_image::planar_regions::PlanarRegionOut;
+use zune_image::traits::{OperationColorValues, OperationsTrait};
 
 /// Perform a sobel image derivative.
 ///
@@ -55,183 +53,332 @@ impl OperationsTrait for Sobel {
     fn name(&self) -> &'static str {
         "Sobel"
     }
+    fn operation_color_values(&self) -> OperationColorValues {
+        OperationColorValues::Linear
+    }
     fn execute_impl(&self, image: &mut Image) -> Result<(), ImageErrors> {
         let depth = image.depth().bit_type();
-        let (width, height) = image.dimensions();
 
-        let sobel_fn = |channel: &mut Channel| -> Result<(), ImageErrors> {
-            let mut out_channel = Channel::new_with_bit_type(channel.len(), depth);
-            match depth {
-                BitType::U8 => sobel_int::<u8>(
-                    channel.reinterpret_as()?,
-                    out_channel.reinterpret_as_mut()?,
-                    width,
-                    height
-                ),
-                BitType::U16 => sobel_int::<u16>(
-                    channel.reinterpret_as()?,
-                    out_channel.reinterpret_as_mut()?,
-                    width,
-                    height
-                ),
-                BitType::F32 => sobel_float::<f32>(
-                    channel.reinterpret_as()?,
-                    out_channel.reinterpret_as_mut()?,
-                    width,
-                    height
-                ),
-                d => return Err(ImageErrors::ImageOperationNotImplemented(self.name(), d))
+        // Pre-allocate the destination buffer
+        let mut dest_image = image.clone();
+
+        // Sobel ignores alpha
+        let ignore_alpha = true;
+
+        match depth {
+            BitType::U8 => {
+                image.par_process_regions_out_of_place::<u8, _>(
+                    &mut dest_image,
+                    ignore_alpha,
+                    |region| {
+                        gradient_region_u8(region, &SOBEL_GX_I32, &SOBEL_GY_I32);
+                    },
+                )?;
             }
-            *channel = out_channel;
-            Ok(())
-        };
+            BitType::U16 => {
+                image.par_process_regions_out_of_place::<u16, _>(
+                    &mut dest_image,
+                    ignore_alpha,
+                    |region| {
+                        gradient_region(region, &SOBEL_GX_I32, &SOBEL_GY_I32);
+                    },
+                )?;
+            }
+            BitType::F32 => {
+                image.par_process_regions_out_of_place::<f32, _>(
+                    &mut dest_image,
+                    ignore_alpha,
+                    |region| {
+                        gradient_region(region, &SOBEL_GX_F32, &SOBEL_GY_F32);
+                    },
+                )?;
+            }
+            d => return Err(ImageErrors::ImageOperationNotImplemented(self.name(), d)),
+        }
 
-        execute_on(sobel_fn, image, true)
+        *image = dest_image;
+        Ok(())
     }
 
     fn supported_types(&self) -> &'static [BitType] {
         &[BitType::U8, BitType::U16, BitType::F32]
     }
 }
-/// Calculate sobel for f32 images
-///
-/// # Arguments
-/// -  in_values: An array which is expected to contain 9 elements 
-///  that represents a 3x3 window for which we are to calculate the sobel 
+
 #[rustfmt::skip]
-fn sobel_inner_f32<T>(c: &[T; 9]) -> T
-    where
-        T: NumOps<T> + Copy + Default,
-        f32: std::convert::From<T>
-{
-    // matrix
-    //  -1, 0, 1,
-    //  -2, 0, 2,
-    //  -1, 0, 1
-    //
-    let mut sum_a = 0.0;
-    sum_a += (f32::from(c[0]) * -1.) + (f32::from(c[2]) * 1.);
-    sum_a += (f32::from(c[3]) * -2.) + (f32::from(c[5]) * 2.);
-    sum_a += (f32::from(c[6]) * -1.) + (f32::from(c[7]) * 1.);
-
-    // matrix
-    // -1,-2,-1,
-    //  0, 0, 0,
-    //  1, 2, 1
-    let mut sum_b = 0.0;
-    sum_b += (f32::from(c[0]) * -1.) + (f32::from(c[1]) * -2.);
-    sum_b += (f32::from(c[2]) * -1.) + (f32::from(c[6]) * 1.);
-    sum_b += (f32::from(c[7]) * 2.) + (f32::from(c[8]) * 1.);
-
-    T::from_f32(((sum_a * sum_a) + (sum_b * sum_b)).sqrt())
-}
-
-/// Calculate sobel for int  images
-///
-/// # Arguments
-/// -  in_values: An array which is expected to contain 9 elements 
-///  that represents a 3x3 window for which we are to calculate the sobel values
-#[allow(clippy::neg_multiply, clippy::identity_op)]
+const SOBEL_GX_I32: [i32; 9] = [
+    -1, 0, 1,
+    -2, 0, 2,
+    -1, 0, 1,
+];
 #[rustfmt::skip]
-fn sobel_inner_i32<T>(c: &[T; 9]) -> T
-    where
-        T: NumOps<T> + Copy + Default,
-        i32: std::convert::From<T>
-{
-    // matrix
-    //  -1, 0, 1,
-    //  -2, 0, 2,
-    //  -1, 0, 1
-    //
-    let mut sum_a = 0;
-    sum_a += (i32::from(c[0]) * -1) + (i32::from(c[2]) * 1);
-    sum_a += (i32::from(c[3]) * -2) + (i32::from(c[5]) * 2);
-    sum_a += (i32::from(c[6]) * -1) + (i32::from(c[7]) * 1);
+const SOBEL_GY_I32: [i32; 9] = [
+    -1, -2, -1,
+     0,  0,  0,
+     1,  2,  1,
+];
+#[rustfmt::skip]
+const SOBEL_GX_F32: [f32; 9] = [
+    -1.0, 0.0, 1.0,
+    -2.0, 0.0, 2.0,
+    -1.0, 0.0, 1.0,
+];
+#[rustfmt::skip]
+const SOBEL_GY_F32: [f32; 9] = [
+    -1.0, -2.0, -1.0,
+     0.0,  0.0,  0.0,
+     1.0,  2.0,  1.0,
+];
+simd_fn!(
+    fn gradient_region_u8(region: &mut PlanarRegionOut<'_, u8>, gx: &[i32; 9], gy: &[i32; 9]) {
+        gradient_region_fallback(region, gx, gy);
+    }
+);
 
-    // matrix
-    // -1,-2,-1,
-    //  0, 0, 0,
-    //  1, 2, 1
-    let mut sum_b = 0;
-    sum_b += (i32::from(c[0]) * -1) + (i32::from(c[1]) * -2);
-    sum_b += (i32::from(c[2]) * -1) + (i32::from(c[6]) * 1);
-    sum_b += (i32::from(c[7]) * 2) + (i32::from(c[8]) * 1);
-
-    T::from_f64(f64::from((sum_a * sum_a) + (sum_b * sum_b)).sqrt())
-}
-
-/// Carry out the sobel filter for a float channel
-///
-/// Uses float operations hence may be slower than the equivalent integer functions
-///
-/// # Arguments.
-/// - in_channel: Input channel for which contains image coefficients
-/// - out_channel: Output channel for which we will fill with new sobel coefficients
-/// - width: Width of input channel
-/// - height: Height of input channel
-pub fn sobel_float<T>(in_channel: &[T], out_channel: &mut [T], width: usize, height: usize)
-where
-    T: Default + NumOps<T> + Copy,
-    f32: std::convert::From<T>
-{
-    //pad here
-    let padded_input = pad(in_channel, width, height, 1, 1, PadMethod::Replicate);
-
-    spatial_NxN::<_, _, 1, 9>(&padded_input, out_channel, width, height, sobel_inner_f32);
-}
-
-/// Carry out the sobel filter for an integer channel
-///
-/// Uses integer operations hence may be faster than the equivalent float functions
-///
-/// # Arguments.
-/// - in_channel: Input channel for which contains image coefficients
-/// - out_channel: Output channel for which we will fill with new sobel coefficients
-/// - width: Width of input channel
-/// - height: Height of input channel
-pub fn sobel_int<T>(in_channel: &[T], out_channel: &mut [T], width: usize, height: usize)
-where
-    T: Default + NumOps<T> + Copy,
-    i32: std::convert::From<T>
-{
-    //pad here
-    let padded_input = pad(in_channel, width, height, 1, 1, PadMethod::Replicate);
-
-    spatial_NxN::<_, _, 1, 9>(&padded_input, out_channel, width, height, sobel_inner_i32);
-}
-
-#[cfg(feature = "benchmarks")]
-#[cfg(test)]
-mod benchmarks {
-    extern crate test;
-
-    use nanorand::Rng;
-
-    use crate::sobel::{sobel_float, sobel_int};
-
-    #[bench]
-    fn bench_sobel_integer_u8(b: &mut test::Bencher) {
-        let width = 800;
-        let height = 800;
-
-        let mut pixels = vec![0_u8; width * height];
-        let mut out_pixels = vec![0; width * height];
-
-        nanorand::WyRand::new().fill(&mut pixels);
-
-        b.iter(|| sobel_int(&pixels, &mut out_pixels, width, height));
+#[inline(always)] // Try to get some calc elided
+pub fn gradient_region_fallback(
+    region: &mut PlanarRegionOut<'_, u8>, gx: &[i32; 9], gy: &[i32; 9],
+) {
+    let width = region.width;
+    if region.src_channels.is_empty() || width == 0 {
+        return;
     }
 
-    #[bench]
-    fn bench_sobel_float(b: &mut test::Bencher) {
-        let width = 800;
-        let height = 800;
+    let global_height = region.src_channels[0].len() / width;
+    let max_y = global_height.saturating_sub(1);
 
-        let mut pixels = vec![0.; width * height];
-        let mut out_pixels = vec![0.; width * height];
+    for (src, dest) in region
+        .src_channels
+        .iter()
+        .zip(region.dest_channels.iter_mut())
+    {
+        for local_y in 0..region.height {
+            let global_y = region.y_offset + local_y;
 
-        nanorand::WyRand::new().fill(&mut pixels);
+            let sy_prev = global_y.saturating_sub(1);
+            let sy_curr = global_y.min(max_y);
+            let sy_next = (global_y + 1).min(max_y);
 
-        b.iter(|| sobel_float(&pixels, &mut out_pixels, width, height));
+            let r0 = &src[sy_prev * width..(sy_prev + 1) * width];
+            let r1 = &src[sy_curr * width..(sy_curr + 1) * width];
+            let r2 = &src[sy_next * width..(sy_next + 1) * width];
+
+            let dest_row = &mut dest[local_y * width..(local_y + 1) * width];
+
+            let compute_edge = |x: usize| -> u8 {
+                let mut sum_x: i32 = 0;
+                let mut sum_y: i32 = 0;
+
+                for (ky, row) in [r0, r1, r2].iter().enumerate() {
+                    for kx in 0..3 {
+                        let sx = if kx == 0 {
+                            x.saturating_sub(1)
+                        } else if kx == 1 {
+                            x
+                        } else {
+                            (x + 1).min(width - 1)
+                        };
+
+                        let px = row[sx] as i32;
+                        let k = ky * 3 + kx;
+
+                        sum_x += px * gx[k];
+                        sum_y += px * gy[k];
+                    }
+                }
+
+                // Integer sum of squares
+                let mag_sq = sum_x * sum_x + sum_y * sum_y;
+                // Single f32 sqrt, then fast saturating cast
+                (mag_sq as f32).sqrt().round().min(255.0) as u8
+            };
+
+            if width == 1 {
+                dest_row[0] = compute_edge(0);
+                continue;
+            }
+
+            // --- LEFT EDGE ---
+            dest_row[0] = compute_edge(0);
+
+            // Create sliding windows of size 3 for each row.
+            // We also slice dest_row to match the `1..width - 1` bounds.
+            let window_iter = r0
+                .windows(3)
+                .zip(r1.windows(3))
+                .zip(r2.windows(3))
+                .zip(&mut dest_row[1..width - 1]);
+
+            for (((w0, w1), w2), dest) in window_iter {
+                // w0, w1, and w2 are slices of exactly length 3.
+                let p00 = i32::from(w0[0]);
+                let p01 = i32::from(w0[1]);
+                let p02 = i32::from(w0[2]);
+
+                let p10 = i32::from(w1[0]);
+                let p11 = i32::from(w1[1]);
+                let p12 = i32::from(w1[2]);
+
+                let p20 = i32::from(w2[0]);
+                let p21 = i32::from(w2[1]);
+                let p22 = i32::from(w2[2]);
+
+                let sum_x = p00 * gx[0]
+                    + p01 * gx[1]
+                    + p02 * gx[2]
+                    + p10 * gx[3]
+                    + p11 * gx[4]
+                    + p12 * gx[5]
+                    + p20 * gx[6]
+                    + p21 * gx[7]
+                    + p22 * gx[8];
+
+                let sum_y = p00 * gy[0]
+                    + p01 * gy[1]
+                    + p02 * gy[2]
+                    + p10 * gy[3]
+                    + p11 * gy[4]
+                    + p12 * gy[5]
+                    + p20 * gy[6]
+                    + p21 * gy[7]
+                    + p22 * gy[8];
+
+                // Square the integers before casting to float.
+                let mag_sq = sum_x * sum_x + sum_y * sum_y;
+
+                // Write directly to the mutable reference of our destination slice
+                *dest = (mag_sq as f32).sqrt().round().min(255.0) as u8;
+            }
+
+            // --- RIGHT EDGE ---
+            dest_row[width - 1] = compute_edge(width - 1);
+        }
+    }
+}
+pub fn gradient_region<T, Acc>(region: &mut PlanarRegionOut<'_, T>, gx: &[Acc; 9], gy: &[Acc; 9])
+where
+    T: NumOps<T> + Copy + Default + Send + Sync,
+    Acc: Copy
+        + Default
+        + std::ops::Add<Output = Acc>
+        + std::ops::Mul<Output = Acc>
+        + Into<f64>
+        + From<T>,
+{
+    let width = region.width;
+    if region.src_channels.is_empty() || width == 0 {
+        return;
+    }
+
+    let global_height = region.src_channels[0].len() / width;
+    let max_y = global_height.saturating_sub(1);
+
+    for (src, dest) in region
+        .src_channels
+        .iter()
+        .zip(region.dest_channels.iter_mut())
+    {
+        for local_y in 0..region.height {
+            let global_y = region.y_offset + local_y;
+
+            // 1. Pre-calculate vertically clamped rows ONCE per output row
+            let sy_prev = global_y.saturating_sub(1);
+            let sy_curr = global_y.min(max_y);
+            let sy_next = (global_y + 1).min(max_y);
+
+            // Extract exact slices for the 3 working rows.
+            // The compiler knows these have length `width`.
+            let r0 = &src[sy_prev * width..(sy_prev + 1) * width];
+            let r1 = &src[sy_curr * width..(sy_curr + 1) * width];
+            let r2 = &src[sy_next * width..(sy_next + 1) * width];
+
+            // Slice the destination row so we can index it directly by `x`
+            let dest_row = &mut dest[local_y * width..(local_y + 1) * width];
+
+            // Helper closure for edge pixels (left and right columns)
+            let compute_edge = |x: usize| -> T {
+                let mut sum_x = Acc::default();
+                let mut sum_y = Acc::default();
+
+                for (ky, row) in [r0, r1, r2].iter().enumerate() {
+                    for kx in 0..3 {
+                        // Safe horizontal clamping for edges
+                        let sx = if kx == 0 {
+                            x.saturating_sub(1)
+                        } else if kx == 1 {
+                            x
+                        } else {
+                            (x + 1).min(width - 1)
+                        };
+
+                        let px = Acc::from(row[sx]);
+                        let k = ky * 3 + kx;
+
+                        sum_x = sum_x + px * gx[k];
+                        sum_y = sum_y + px * gy[k];
+                    }
+                }
+
+                let gxf: f64 = sum_x.into();
+                let gyf: f64 = sum_y.into();
+                let magnitude = (gxf * gxf + gyf * gyf).sqrt();
+                T::from_f64(magnitude).zclamp(T::min_val(), T::max_val())
+            };
+
+            // Handle 1-pixel wide images edge-case gracefully
+            if width == 1 {
+                dest_row[0] = compute_edge(0);
+                continue;
+            }
+
+            // --- 2. LEFT EDGE ---
+            dest_row[0] = compute_edge(0);
+
+            // --- 3. INTERIOR (Unrolled & Zero Bounds Checks) ---
+            // Because x goes from 1 to width-2, x-1..x+1 is guaranteed to
+            // be within 0..width, removing inner-loop panics/bounds checks.
+            for x in 1..width - 1 {
+                let p00 = Acc::from(r0[x - 1]);
+                let p01 = Acc::from(r0[x]);
+                let p02 = Acc::from(r0[x + 1]);
+
+                let p10 = Acc::from(r1[x - 1]);
+                let p11 = Acc::from(r1[x]);
+                let p12 = Acc::from(r1[x + 1]);
+
+                let p20 = Acc::from(r2[x - 1]);
+                let p21 = Acc::from(r2[x]);
+                let p22 = Acc::from(r2[x + 1]);
+
+                let sum_x = p00 * gx[0]
+                    + p01 * gx[1]
+                    + p02 * gx[2]
+                    + p10 * gx[3]
+                    + p11 * gx[4]
+                    + p12 * gx[5]
+                    + p20 * gx[6]
+                    + p21 * gx[7]
+                    + p22 * gx[8];
+
+                let sum_y = p00 * gy[0]
+                    + p01 * gy[1]
+                    + p02 * gy[2]
+                    + p10 * gy[3]
+                    + p11 * gy[4]
+                    + p12 * gy[5]
+                    + p20 * gy[6]
+                    + p21 * gy[7]
+                    + p22 * gy[8];
+
+                let gxf: f64 = sum_x.into();
+                let gyf: f64 = sum_y.into();
+                let magnitude = (gxf * gxf + gyf * gyf).sqrt();
+
+                dest_row[x] = T::from_f64(magnitude).zclamp(T::min_val(), T::max_val());
+            }
+
+            // --- 4. RIGHT EDGE ---
+            dest_row[width - 1] = compute_edge(width - 1);
+        }
     }
 }

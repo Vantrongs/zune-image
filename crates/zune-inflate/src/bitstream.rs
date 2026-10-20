@@ -14,27 +14,27 @@
 pub struct BitStreamReader<'src> {
     // buffer from which we are pulling in bits from
     // used in decompression.
-    pub src:       &'src [u8],
+    pub src: &'src [u8],
     // position in our buffer,
-    pub position:  usize,
+    pub position: usize,
     pub bits_left: u8,
-    pub buffer:    u64,
-    pub over_read: usize
+    pub buffer: u64,
+    pub over_read: usize,
+    // Indicates if this is the last chunk of the stream.
+    pub is_final: bool,
 }
 
 impl<'src> BitStreamReader<'src> {
     /// Create a new `BitStreamReader` instance
     ///
-    /// # Expectations
-    /// The buffer must be padded with fill bytes in the end,
-    /// if not, this becomes UB in the refill phase.
-    pub fn new(in_buffer: &'src [u8]) -> BitStreamReader<'src> {
+    pub fn new(in_buffer: &'src [u8], is_final: bool) -> BitStreamReader<'src> {
         BitStreamReader {
             bits_left: 0,
-            buffer:    0,
-            src:       in_buffer,
-            position:  0,
-            over_read: 0
+            buffer: 0,
+            src: in_buffer,
+            position: 0,
+            over_read: 0,
+            is_final,
         }
     }
     /// Refill the bitstream ensuring the buffer has bits between
@@ -64,33 +64,7 @@ impl<'src> BitStreamReader<'src> {
                 // bits left are now between 56-63
                 self.bits_left |= 56;
             }
-            None => self.refill_slow()
-        }
-    }
-    #[inline(always)]
-    pub fn refill_inner_loop(&mut self) {
-        /*
-         * The refill always guarantees refills between 56-63
-         *
-         * Bits stored will never go above 63 and if bits are in the range 56-63 no refills occur.
-         */
-        let mut buf = [0; 8];
-
-        if let Some(bytes) = self.src.get(self.position..self.position + 8) {
-            {
-                buf.copy_from_slice(bytes);
-                // create a u64 from an array of u8's
-                let new_buffer = u64::from_le_bytes(buf);
-                // num indicates how many bytes we actually consumed.
-                let num = 63 ^ self.bits_left;
-                // offset position
-                self.position += (num >> 3) as usize;
-                // shift number of bits
-                self.buffer |= new_buffer << self.bits_left;
-                // update bits left
-                // bits left are now between 56-63
-                self.bits_left |= 56;
-            }
+            None => self.refill_slow(),
         }
     }
     #[inline(never)]
@@ -106,9 +80,14 @@ impl<'src> BitStreamReader<'src> {
             self.bits_left += 8;
             self.position += 1;
         }
-        while self.bits_left < 56 {
-            self.bits_left += 8;
-            self.over_read += 1;
+
+        // ONLY pad with dummy zeros if we are absolutely sure
+        // there is no more data coming.
+        if self.is_final {
+            while self.bits_left < 56 {
+                self.bits_left += 8;
+                self.over_read += 1;
+            }
         }
     }
 
@@ -171,5 +150,69 @@ impl<'src> BitStreamReader<'src> {
     /// may not be accurate
     pub const fn remaining_bytes(&self) -> usize {
         self.src.len().saturating_sub(self.position)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_read_single_chunk() {
+        // 0xAA = 10101010, 0x55 = 01010101
+        let data = [0xAA, 0x55];
+        let mut reader = BitStreamReader::new(&data, true);
+
+        reader.refill();
+
+        // Deflate reads LSB first.
+        // 0xAA -> lower 4 bits are 1010 (10), upper are 1010 (10)
+        assert_eq!(reader.get_bits(4), 0x0A);
+        assert_eq!(reader.get_bits(4), 0x0A);
+
+        // 0x55 -> lower 4 bits are 0101 (5), upper are 0101 (5)
+        assert_eq!(reader.get_bits(4), 0x05);
+        assert_eq!(reader.get_bits(4), 0x05);
+    }
+
+    #[test]
+    fn test_non_final_chunk_starvation() {
+        // Only 1 byte, and it's NOT the final chunk.
+        let data = [0xFF];
+        let mut reader = BitStreamReader::new(&data, false);
+
+        reader.refill();
+
+        // Since it's not final, refill_slow should NOT pad with zeros.
+        // It should only load the exactly 8 bits available.
+        assert_eq!(reader.get_bits_left(), 8);
+        assert_eq!(reader.over_read, 0);
+
+        // Read the 8 bits
+        assert_eq!(reader.get_bits(8), 0xFF);
+
+        // Try to refill again. It should do nothing because there's no data.
+        reader.refill();
+        assert_eq!(reader.get_bits_left(), 0);
+        assert_eq!(reader.over_read, 0);
+    }
+
+    #[test]
+    fn test_final_chunk_padding() {
+        // Only 1 byte, but it IS the final chunk.
+        let data = [0xFF];
+        let mut reader = BitStreamReader::new(&data, true);
+
+        reader.refill();
+
+        // Because it's the final chunk, refill_slow SHOULD pad to at least 56 bits.
+        assert!(reader.get_bits_left() >= 56);
+        assert!(reader.over_read > 0);
+
+        // The actual byte should be preserved at the bottom of the buffer
+        assert_eq!(reader.get_bits(8), 0xFF);
+
+        // The padded bits should be zeros
+        assert_eq!(reader.get_bits(8), 0x00);
     }
 }

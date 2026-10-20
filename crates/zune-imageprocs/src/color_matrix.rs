@@ -52,40 +52,61 @@ use zune_core::bit_depth::BitType;
 use zune_core::colorspace::ColorSpace;
 use zune_image::errors::ImageErrors;
 use zune_image::image::Image;
-use zune_image::traits::OperationsTrait;
+use zune_image::traits::{OperationColorValues, OperationsTrait};
 
 use crate::traits::NumOps;
 
-/// A color matrix filter
+/// Applies a 4x5 color matrix transformation to the image.
 ///
-/// The filter will convert the colorspace into RGBA,apply the color matrix,
-/// and then convert it back to the initial colorspace
+/// A color matrix operation multiplies the RGBA color channels of an image by an
+/// arbitrary transformation matrix. This is incredibly powerful for applying color
+/// grading, sepia filters, hue shifts, saturation adjustments, and color inversions.
 ///
-/// # Example
-/// ```rust
-/// use zune_image::errors::ImageErrors;
-/// use zune_core::colorspace::ColorSpace;
-/// use zune_image::image::Image;
-/// use zune_image::traits::OperationsTrait;
-/// use zune_imageprocs::color_matrix::ColorMatrix;
+/// Internally, the image is converted to `ColorSpace::RGBA`, processed, and then
+/// safely converted back to its original colorspace.
 ///
-/// fn main()->Result<(),ImageErrors>{
-///    
-///     let mut image = Image::fill(0.0f32,ColorSpace::RGB,100,100);
-///     // convert to grayscale using a color matrix
-///     let filter = ColorMatrix::new(
-///         [[0.2, 0.5, 0.3, 0.0, 0.0],
-///         [0.2, 0.5, 0.3, 0.0, 0.0],
-///         [0.2, 0.5, 0.3, 0.0, 0.0],
-///         [0.0, 0.0, 0.0, 1.0, 0.0]]);
+/// # Mathematical Definition
 ///
-///     filter.execute(&mut image)?;
-///     
-///     Ok(())
-/// }
+/// For a given pixel with channels `(R, G, B, A)`, the new values are computed as:
+///
+/// ```text
+/// R' = (m[0][0] * R) + (m[0][1] * G) + (m[0][2] * B) + (m[0][3] * A) + (m[0][4] * MAX)
+/// G' = (m[1][0] * R) + (m[1][1] * G) + (m[1][2] * B) + (m[1][3] * A) + (m[1][4] * MAX)
+/// B' = (m[2][0] * R) + (m[2][1] * G) + (m[2][2] * B) + (m[2][3] * A) + (m[2][4] * MAX)
+/// A' = (m[3][0] * R) + (m[3][1] * G) + (m[3][2] * B) + (m[3][3] * A) + (m[3][4] * MAX)
+/// ```
+///
+/// *Note:* The final column (`m[x][4]`) represents a translation (offset). It is expected
+/// to be a normalized value between `0.0` and `1.0`, which the library scales appropriately
+/// by the maximum value of the bit depth (`MAX`).
+///
+/// # Examples
+///
+/// **Identity Matrix** (Does nothing):
+/// ```text
+/// [[1.0, 0.0, 0.0, 0.0, 0.0],
+///  [0.0, 1.0, 0.0, 0.0, 0.0],
+///  [0.0, 0.0, 1.0, 0.0, 0.0],
+///  [0.0, 0.0, 0.0, 1.0, 0.0]]
+/// ```
+///
+/// **Grayscale Conversion** (Luminance weights):
+/// ```text
+/// [[0.2, 0.5, 0.3, 0.0, 0.0],
+///  [0.2, 0.5, 0.3, 0.0, 0.0],
+///  [0.2, 0.5, 0.3, 0.0, 0.0],
+///  [0.0, 0.0, 0.0, 1.0, 0.0]]
+/// ```
+///
+/// **Color Invert**:
+/// ```text
+/// [[-1.0,  0.0,  0.0, 0.0, 1.0],
+///  [ 0.0, -1.0,  0.0, 0.0, 1.0],
+///  [ 0.0,  0.0, -1.0, 0.0, 1.0],
+///  [ 0.0,  0.0,  0.0, 1.0, 0.0]]
 /// ```
 pub struct ColorMatrix {
-    matrix: [[f32; 5]; 4]
+    matrix: [[f32; 5]; 4],
 }
 
 impl ColorMatrix {
@@ -105,9 +126,9 @@ impl ColorMatrix {
         if slice.len() == 20 {
             let mut matrix = [[0f32; 5]; 4];
             let mut c = slice.chunks_exact(5);
-            matrix
-                .iter_mut()
-                .for_each(|x| x.copy_from_slice(c.next().unwrap()));
+            for x in &mut matrix {
+                x.copy_from_slice(c.next().unwrap());
+            }
             Some(ColorMatrix::new(matrix))
         } else {
             None
@@ -120,6 +141,9 @@ impl OperationsTrait for ColorMatrix {
         "Color Matrix"
     }
 
+    fn operation_color_values(&self) -> OperationColorValues {
+        OperationColorValues::Gamma
+    }
     #[allow(clippy::many_single_char_names)]
     fn execute_impl(&self, image: &mut Image) -> Result<(), ImageErrors> {
         let original_color = image.colorspace();
@@ -128,36 +152,27 @@ impl OperationsTrait for ColorMatrix {
         image.convert_color(ColorSpace::RGBA)?;
 
         let depth = image.depth();
-        for frame in image.frames_mut() {
-            let channels = frame.channels_vec();
-
-            let (r, rest) = channels.split_at_mut(1);
-            let (g, rest) = rest.split_at_mut(1);
-            let (b, a) = rest.split_at_mut(1);
-
-            match depth.bit_type() {
-                BitType::U8 => color_matrix_component::<u8>(
-                    r[0].reinterpret_as_mut()?,
-                    g[0].reinterpret_as_mut()?,
-                    b[0].reinterpret_as_mut()?,
-                    a[0].reinterpret_as_mut()?,
-                    &self.matrix
-                ),
-                BitType::U16 => color_matrix_component::<u16>(
-                    r[0].reinterpret_as_mut()?,
-                    g[0].reinterpret_as_mut()?,
-                    b[0].reinterpret_as_mut()?,
-                    a[0].reinterpret_as_mut()?,
-                    &self.matrix
-                ),
-                BitType::F32 => color_matrix_component::<f32>(
-                    r[0].reinterpret_as_mut()?,
-                    g[0].reinterpret_as_mut()?,
-                    b[0].reinterpret_as_mut()?,
-                    a[0].reinterpret_as_mut()?,
-                    &self.matrix
-                ),
-                d => return Err(ImageErrors::ImageOperationNotImplemented(self.name(), d))
+        match depth.bit_type() {
+            BitType::U8 => image.par_process_regions::<u8, _>(false, |region| {
+                if let [r_slice, g_slice, b_slice, a_slice, ..] = region.channels {
+                    color_matrix_component(r_slice, g_slice, b_slice, a_slice, &self.matrix)
+                }
+            })?,
+            BitType::U16 => image.par_process_regions::<u16, _>(false, |region| {
+                if let [r_slice, g_slice, b_slice, a_slice, ..] = region.channels {
+                    color_matrix_component(r_slice, g_slice, b_slice, a_slice, &self.matrix);
+                }
+            })?,
+            BitType::F32 => image.par_process_regions::<f32, _>(false, |region| {
+                if let [r_slice, g_slice, b_slice, a_slice, ..] = region.channels {
+                    color_matrix_component(r_slice, g_slice, b_slice, a_slice, &self.matrix);
+                }
+            })?,
+            _ => {
+                return Err(ImageErrors::ImageOperationNotImplemented(
+                    self.name(),
+                    depth.bit_type(),
+                ))
             }
         }
         // convert back to original color
@@ -172,10 +187,14 @@ impl OperationsTrait for ColorMatrix {
 }
 
 fn color_matrix_component<T: NumOps<T> + Copy>(
-    c1: &mut [T], c2: &mut [T], c3: &mut [T], alpha: &mut [T], color_matrix: &[[f32; 5]; 4]
+    c1: &mut [T], c2: &mut [T], c3: &mut [T], alpha: &mut [T], color_matrix: &[[f32; 5]; 4],
 ) where
-    f32: From<T>
+    f32: From<T>,
 {
+    assert_eq!(c1.len(), c2.len());
+    assert_eq!(c2.len(), c3.len());
+    assert_eq!(c3.len(), alpha.len());
+
     let max_t = f32::from(T::MAX_VAL);
     // we need to multiply the first channel with the color matrix and then add the new offset only from the first row
 
@@ -246,7 +265,7 @@ mod benchmarks {
             [0.2, 0.5, 0.3, 0.0, 0.0],
             [0.2, 0.5, 0.3, 0.0, 0.0],
             [0.2, 0.5, 0.3, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0, 0.0]
+            [0.0, 0.0, 0.0, 1.0, 0.0],
         ]);
 
         b.iter(|| {

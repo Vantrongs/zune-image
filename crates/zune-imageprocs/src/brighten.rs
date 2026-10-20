@@ -25,13 +25,11 @@
 //!
 use zune_core::bit_depth::BitType;
 use zune_core::colorspace::ColorSpace;
-use zune_image::channel::Channel;
 use zune_image::errors::ImageErrors;
 use zune_image::image::Image;
-use zune_image::traits::OperationsTrait;
+use zune_image::traits::{OperationColorValues, OperationsTrait};
 
 use crate::traits::NumOps;
-use crate::utils::execute_on;
 
 /// Brighten struct
 ///
@@ -54,7 +52,7 @@ use crate::utils::execute_on;
 /// ```
 #[derive(Default)]
 pub struct Brighten {
-    value: f32
+    value: f32,
 }
 
 impl Brighten {
@@ -62,7 +60,7 @@ impl Brighten {
     ///
     /// # Arguments
     /// - value: Value to increase the channel values with, must be between -1 and 1, where 1 stands for maximum brightness
-    ///  and -1 for darkness
+    ///   and -1 for darkness
     #[must_use]
     pub fn new(value: f32) -> Brighten {
         Brighten { value }
@@ -74,6 +72,9 @@ impl OperationsTrait for Brighten {
         "Brighten"
     }
 
+    fn operation_color_values(&self) -> OperationColorValues {
+        OperationColorValues::Gamma
+    }
     #[allow(
         clippy::cast_sign_loss,
         clippy::cast_precision_loss,
@@ -83,31 +84,45 @@ impl OperationsTrait for Brighten {
         let max_val = image.depth().max_value();
         let depth = image.depth();
 
-        let brighten_fn = |channel: &mut Channel| -> Result<(), ImageErrors> {
-            match depth.bit_type() {
-                BitType::U8 => brighten(
-                    channel.reinterpret_as_mut::<u8>()?,
-                    self.value,
-                    u8::try_from(max_val.clamp(0, 255)).unwrap()
-                ),
-                BitType::U16 => brighten(channel.reinterpret_as_mut::<u16>()?, self.value, max_val),
-                BitType::F32 => brighten_f32(
-                    channel.reinterpret_as_mut::<f32>()?,
-                    self.value,
-                    f32::from(max_val)
-                ),
-                d => return Err(ImageErrors::ImageOperationNotImplemented(self.name(), d))
+        match depth.bit_type() {
+            BitType::U8 => {
+                image.par_process_regions::<u8, _>(true, |region| {
+                    for channel in region.channels.iter_mut() {
+                        brighten(
+                            channel,
+                            self.value,
+                            u8::try_from(max_val.clamp(0, 255)).unwrap_or(u8::MAX),
+                        );
+                    }
+                })?;
             }
-            Ok(())
-        };
-        execute_on(brighten_fn, image, true)
+            BitType::U16 => {
+                image.par_process_regions::<u16, _>(true, |region| {
+                    for channel in region.channels.iter_mut() {
+                        brighten(channel, self.value, max_val);
+                    }
+                })?;
+            }
+            BitType::F32 => image.par_process_regions::<f32, _>(true, |region| {
+                for channel in region.channels.iter_mut() {
+                    brighten_f32(channel, self.value, f32::from(max_val));
+                }
+            })?,
+            _ => {
+                return Err(ImageErrors::ImageOperationNotImplemented(
+                    self.name(),
+                    depth.bit_type(),
+                ))
+            }
+        }
+        Ok(())
     }
     fn supported_colorspaces(&self) -> &'static [ColorSpace] {
         &[
             ColorSpace::RGBA,
             ColorSpace::RGB,
             ColorSpace::LumaA,
-            ColorSpace::Luma
+            ColorSpace::Luma,
         ]
     }
 
@@ -128,14 +143,14 @@ impl OperationsTrait for Brighten {
 ///
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
 pub fn brighten<T: Copy + PartialOrd + NumOps<T> + Default>(
-    channel: &mut [T], value: f32, _max_value: T
+    channel: &mut [T], value: f32, _max_value: T,
 ) {
     let t_min = T::MIN_VAL.to_f32();
     let t_max = T::MAX_VAL.to_f32();
     let scale_v = value.clamp(-1f32, 1f32) * (t_max - t_min);
-    channel
-        .iter_mut()
-        .for_each(|x| *x = T::from_f32((x.to_f32() + scale_v).zclamp(t_min, t_max)));
+    for x in channel.iter_mut() {
+        *x = T::from_f32((x.to_f32() + scale_v).zclamp(t_min, t_max));
+    }
 }
 
 /// Brighten operation
@@ -148,9 +163,8 @@ pub fn brighten<T: Copy + PartialOrd + NumOps<T> + Default>(
 ///
 /// returns: ()
 ///
-
 pub fn brighten_f32(channel: &mut [f32], value: f32, max_value: f32) {
-    channel
-        .iter_mut()
-        .for_each(|x| *x = (*x + value).clamp(0.0, max_value));
+    for x in channel.iter_mut() {
+        *x = (*x + value).clamp(0.0, max_value);
+    }
 }

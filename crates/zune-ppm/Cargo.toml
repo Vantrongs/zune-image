@@ -18,4 +18,4 @@ description = "Portable Pixmap and Portable Floatmap Format Decoder and Encoder"
 log = ["zune-core/log"]
 
 [dependencies]
-zune-core = { version = "0.5.3" }
+zune-core = { path = "../zune-core", version = "^0.5.1" }

@@ -16,11 +16,12 @@ use zune_core::bytestream::{ZByteIoError, ZByteReaderTrait, ZSeekFrom};
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
 
-use crate::bitstream::BitStream;
+use crate::bitstream::{BitStream, BitStreamHuffman, HuffmanBitstreamState};
 use crate::errors::DecodeErrors;
-use crate::mcu::McuContinuation;
+use crate::marker::Marker;
+use crate::mcu::{McuContinuation, McuWidthContext};
 use crate::mcu_prog::get_marker;
-use crate::misc::setup_component_params;
+use crate::misc::{setup_component_params, SOFMarkers};
 #[cfg(not(feature = "std"))]
 use crate::progress::ProgressCursor;
 use crate::progress::{stopped, Progress};
@@ -231,7 +232,7 @@ pub struct GrayscaleRows<'p, S> {
     source: Arc<Source<S>>,
     progress: &'p dyn Progress,
     decoder: JpegDecoder<RowInput<'p, S>>,
-    bits: BitStream,
+    bits: BitStreamHuffman,
     next_row: usize,
     /// The data ended (or broke off, when not strict); the remaining rows are 128.
     fill_rest: bool,
@@ -244,9 +245,9 @@ pub struct GrayscaleRows<'p, S> {
 pub struct GrayscaleCheckpoint<S> {
     source: Arc<Source<S>>,
     position: usize,
-    bits: BitStream,
+    bits: HuffmanBitstreamState,
     next_row: usize,
-    dc_pred: i32,
+    dc_pred: (i32, i32),
     todo: usize,
     raw: Vec<i16>,
     fill_rest: bool,
@@ -257,7 +258,7 @@ impl<S> Clone for GrayscaleCheckpoint<S> {
         Self {
             source: Arc::clone(&self.source),
             position: self.position,
-            bits: self.bits.clone(),
+            bits: self.bits,
             next_row: self.next_row,
             dc_pred: self.dc_pred,
             todo: self.todo,
@@ -293,15 +294,17 @@ impl<'p, S: AsRef<[u8]>> GrayscaleRows<'p, S> {
         progress: &'p dyn Progress,
     ) -> Result<Self, RowDecodeError> {
         setup_component_params(&mut decoder)?;
-        decoder.check_tables()?;
+        decoder.check_tables::<BitStreamHuffman>()?;
         let component = &mut decoder.components[0];
         component.needed = true;
         component.raw_coeff = vec![0; component.width_stride * 8];
+        let mut bits = BitStreamHuffman::new();
+        bits.set_strict(decoder.options.strict_mode());
         Ok(Self {
             source,
             progress,
             decoder,
-            bits: BitStream::new(),
+            bits,
             next_row: 0,
             fill_rest: false,
             failed: false,
@@ -360,11 +363,13 @@ impl<'p, S: AsRef<[u8]>> GrayscaleRows<'p, S> {
         Ok(result?)
     }
 
+    /// Mirrors the single-scan path of `JpegDecoder::decode_mcu_ycbcr_baseline`, one MCU
+    /// row at a time.
     fn read_band(&mut self, output: &mut [u8]) -> Result<usize, DecodeErrors> {
         let (width, height) = self.dimensions();
-        if self.bits.overread_by > 0 && !self.fill_rest {
-            if self.decoder.options.strict_mode() {
-                return Err(DecodeErrors::FormatStatic("Premature end of buffer"));
+        if self.bits.overread_by() > 0 && !self.fill_rest {
+            if self.decoder.scan_eof_is_error() {
+                return Err(DecodeErrors::ExhaustedData);
             }
             self.fill_rest = true;
         }
@@ -372,40 +377,77 @@ impl<'p, S: AsRef<[u8]>> GrayscaleRows<'p, S> {
             output.fill(128);
         } else {
             let mcu_row = self.next_row / 8;
-            let continuation = self.decoder.inner_decode_mcu_width::<false, false>(
-                width.div_ceil(8),
+            let mcu_height = height.div_ceil(8);
+            let mut context = McuWidthContext {
+                mcu_width: width.div_ceil(8),
                 mcu_row,
-                &mut [0; 64],
-                &mut self.bits,
-                &mut core::array::from_fn(|_| Vec::new()),
-            )?;
+                start_col: 0,
+                pixels_written: 0,
+                tmp: &mut [0; 64],
+                stream: &mut self.bits,
+                progressive: &mut core::array::from_fn(|_| Vec::new()),
+                is_last_row: mcu_row + 1 >= mcu_height,
+            };
+            // Whether the data ended or broke off within this row, which is then
+            // finished from what was decoded.
+            let ended = match self
+                .decoder
+                .decode_mcu_width::<false, BitStreamHuffman>(&mut context)
+            {
+                Ok(McuContinuation::Ok) => false,
+                Ok(McuContinuation::Terminate(_)) => true,
+                Err(e) if e.is_recoverable_eof() && !self.decoder.scan_eof_is_error() => true,
+                Err(e) => return Err(e),
+                // `new` rejected sources with these markers.
+                Ok(
+                    McuContinuation::AnotherSos
+                    | McuContinuation::InterScanMarker(_)
+                    | McuContinuation::DnlFound(_),
+                ) => {
+                    return Err(DecodeErrors::FormatStatic(
+                        "Row decoding cannot continue across scans",
+                    ));
+                }
+            };
             self.decoder.post_process(
                 output,
                 mcu_row,
-                height.div_ceil(8),
+                mcu_height,
                 width,
                 width.div_ceil(8) * 8,
                 &mut 0,
                 &mut [],
             )?;
-            match continuation {
-                McuContinuation::Ok => {}
-                McuContinuation::Terminate => self.fill_rest = true,
-                // `new` rejected sources with these markers.
-                McuContinuation::AnotherSos | McuContinuation::InterScanMarker(_) => {
-                    return Err(DecodeErrors::FormatStatic(
-                        "Row decoding cannot continue across scans",
-                    ));
-                }
-            }
+            self.fill_rest = ended;
         }
         let rows = output.len() / width;
         self.next_row += rows;
-        if self.next_row == height && !self.fill_rest && !self.bits.seen_eoi {
-            // Consume the final marker as `JpegDecoder::decode` does, on a best-effort basis.
-            let _ = get_marker(&mut self.decoder.stream, &mut self.bits);
+        if self.next_row == height && !self.fill_rest {
+            self.finish_scan()?;
         }
         Ok(rows)
+    }
+
+    /// Checks the end of the data after the last row as `JpegDecoder::decode` does.
+    fn finish_scan(&mut self) -> Result<(), DecodeErrors> {
+        let strict = self.decoder.scan_eof_is_error();
+        if self.bits.overread_by() > 0 && strict {
+            return Err(DecodeErrors::ExhaustedData);
+        }
+        if *self.bits.seen_eoi() {
+            return Ok(());
+        }
+        match get_marker(&mut self.decoder.stream, &mut self.bits) {
+            Ok(Marker::EOI) => *self.bits.seen_eoi() = true,
+            Ok(marker) if strict => {
+                return Err(DecodeErrors::Format(alloc::format!(
+                    "Unexpected marker {marker:?} after completed scan"
+                )));
+            }
+            Err(e) if strict => return Err(e),
+            Ok(_) | Err(_) => {}
+        }
+        Ok(())
     }
 
     /// The reader's state at its next row. No input bytes are copied.
@@ -416,9 +458,12 @@ impl<'p, S: AsRef<[u8]>> GrayscaleRows<'p, S> {
         Ok(GrayscaleCheckpoint {
             source: Arc::clone(&self.source),
             position: input_position(&mut self.decoder)?,
-            bits: self.bits.clone(),
+            bits: self.bits.save_state(),
             next_row: self.next_row,
-            dc_pred: self.decoder.components[0].dc_pred,
+            dc_pred: (
+                self.decoder.components[0].dc_pred,
+                self.decoder.components[0].dc_diff,
+            ),
             todo: self.decoder.todo,
             raw: self.decoder.components[0].raw_coeff.clone(),
             fill_rest: self.fill_rest,
@@ -435,10 +480,10 @@ impl<'p, S: AsRef<[u8]>> GrayscaleRows<'p, S> {
             .stream
             .set_position(checkpoint.position)
             .map_err(DecodeErrors::from)?;
-        self.bits = checkpoint.bits.clone();
+        self.bits.restore_state(checkpoint.bits);
         self.next_row = checkpoint.next_row;
         let component = &mut self.decoder.components[0];
-        component.dc_pred = checkpoint.dc_pred;
+        (component.dc_pred, component.dc_diff) = checkpoint.dc_pred;
         component.raw_coeff.copy_from_slice(&checkpoint.raw);
         self.decoder.todo = checkpoint.todo;
         self.fill_rest = checkpoint.fill_rest;
@@ -489,7 +534,13 @@ fn parse_headers<'p, S: AsRef<[u8]>>(
         return Err(RowDecodeError::Stopped);
     }
     parsed?;
-    if decoder.is_progressive
+    decoder.ensure_supported_encoding()?;
+    if !matches!(
+        decoder.info.sof,
+        SOFMarkers::BaselineDct | SOFMarkers::ExtendedSequentialHuffman
+    ) || decoder.is_arithmetic
+        || decoder.dnl_image
+        || decoder.is_progressive
         || decoder.input_colorspace != ColorSpace::Luma
         || decoder.components.len() != 1
         || decoder.num_scans != 1

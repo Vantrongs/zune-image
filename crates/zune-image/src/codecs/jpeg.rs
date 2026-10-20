@@ -15,8 +15,11 @@
 //! The decoder and encoder both support metadata extraction and saving.
 //!
 use jpeg_encoder::{ColorType, EncodingError, JfifWrite};
+use log::{info, trace};
 use zune_core::bit_depth::BitDepth;
-use zune_core::bytestream::{ZByteIoError, ZByteReaderTrait, ZByteWriterTrait, ZWriter};
+use zune_core::bytestream::{
+    ZByteIoError, ZByteReaderTrait, ZByteWriterTrait, ZCursor, ZSeekFrom, ZWriter,
+};
 use zune_core::colorspace::ColorSpace;
 use zune_core::log::warn;
 use zune_core::options::EncoderOptions;
@@ -30,19 +33,43 @@ use crate::metadata::ImageMetadata;
 use crate::traits::{DecodeInto, DecoderTrait, EncoderTrait};
 
 struct TempVt<'a, T: ZByteWriterTrait> {
-    inner: &'a mut ZWriter<T>
+    inner: &'a mut ZWriter<T>,
 }
 impl<'a, T: ZByteWriterTrait> JfifWrite for TempVt<'a, T> {
     fn write_all(&mut self, buf: &[u8]) -> Result<(), EncodingError> {
         self.inner.write_all(buf).map_err(|r| match r {
             ZByteIoError::StdIoError(e) => EncodingError::IoError(e),
-            r => EncodingError::Write(format!("{:?}", r))
+            r => EncodingError::Write(format!("{:?}", r)),
         })
     }
 }
 impl<T: ZByteReaderTrait> DecoderTrait for zune_jpeg::JpegDecoder<T> {
     fn decode(&mut self) -> Result<Image, crate::errors::ImageErrors> {
-        let metadata = self.read_headers()?.unwrap();
+        self.read_headers()?;
+        // best case uhdr identification
+
+        let is_uhdr = {
+            let info = self.info().unwrap();
+            !info.gain_map_info.is_empty()
+            // TODO: Add more checks
+        };
+        if is_uhdr {
+            #[cfg(feature = "uhdr")]
+            {
+                info!("Treating this JPEG as uhdr");
+                // seek to start, we will destroy this later so its safe
+                let reader = self.inner_reader();
+                let current_pos = reader.position()?;
+                let data = reader.seek(ZSeekFrom::Start(0))?;
+                // read whole data to vec
+                let mut data = vec![];
+                reader.read_all(&mut data)?;
+                let image = uhdr::decode_uhdr_tone_mapped(ZCursor::new(data), 1.2f32)?;
+                // set the pos back to original so that the invariants of this decode are held
+                reader.set_position(current_pos as usize)?;
+                return Ok(image);
+            }
+        }
 
         let pixels = self
             .decode()
@@ -50,6 +77,8 @@ impl<T: ZByteReaderTrait> DecoderTrait for zune_jpeg::JpegDecoder<T> {
 
         let colorspace = self.output_colorspace().unwrap();
         let (width, height) = self.dimensions().unwrap();
+        let mut metadata = self.read_headers()?.unwrap();
+        metadata.set_dimensions(width, height);
 
         let mut image = Image::from_u8(&pixels, width, height, colorspace);
         image.metadata = metadata;
@@ -79,8 +108,8 @@ impl<T: ZByteReaderTrait> DecoderTrait for zune_jpeg::JpegDecoder<T> {
             format: Some(ImageFormat::JPEG),
             colorspace: self.input_colorspace().unwrap(),
             depth: BitDepth::Eight,
-            width: width,
-            height: height,
+            width,
+            height,
             ..Default::default()
         };
         #[cfg(feature = "metadata")]
@@ -105,6 +134,66 @@ impl From<zune_jpeg::errors::DecodeErrors> for ImageErrors {
         ImageErrors::ImageDecodeErrors(err)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn marker_segment(code: u8, body: &[u8]) -> Vec<u8> {
+        let mut marker = vec![0xFF, code];
+        marker.extend(((body.len() + 2) as u16).to_be_bytes());
+        marker.extend_from_slice(body);
+        marker
+    }
+
+    #[test]
+    fn dnl_decode_refreshes_public_image_metadata_dimensions() {
+        let base = include_bytes!("../../../zune-jpeg/tests/images/dnl_read_ahead.jpg");
+        let sof = base
+            .windows(2)
+            .position(|marker| marker == [0xFF, 0xC0])
+            .unwrap();
+        let height = u16::from_be_bytes([base[sof + 5], base[sof + 6]]);
+        let width = u16::from_be_bytes([base[sof + 7], base[sof + 8]]);
+        let eoi = base.windows(2).rposition(|marker| marker == [0xFF, 0xD9]).unwrap();
+        let mut data = base[..eoi].to_vec();
+        data[sof + 5..sof + 7].fill(0);
+        data.extend([0xFF, 0xDC, 0x00, 0x04]);
+        data.extend(height.to_be_bytes());
+        data.extend_from_slice(&base[eoi..]);
+
+        let mut decoder = JpegDecoder::new(ZCursor::new(&data));
+        let image = <JpegDecoder<_> as DecoderTrait>::decode(&mut decoder).unwrap();
+        let expected = (usize::from(width), usize::from(height));
+        assert_eq!(image.dimensions(), expected);
+        assert_eq!(image.metadata.dimensions(), expected);
+    }
+
+    #[test]
+    fn jpeg_wrapper_refreshes_post_sos_metadata() {
+        let base = include_bytes!("../../../../test-images/jpeg/2029.jpg");
+        let eoi = base.windows(2).rposition(|marker| marker == [0xFF, 0xD9]).unwrap();
+        let icc_payload = b"post-SOS ICC profile";
+        let mut icc_body = b"ICC_PROFILE\0".to_vec();
+        icc_body.extend([1, 1]);
+        icc_body.extend_from_slice(icc_payload);
+        let exif_body = b"Exif\0\0II\x2A\0\x08\0\0\0\0\0\0\0\0\0\0\0";
+
+        let mut data = base[..eoi].to_vec();
+        data.extend_from_slice(&marker_segment(0xE2, &icc_body));
+        data.extend_from_slice(&marker_segment(0xE1, exif_body));
+        data.extend_from_slice(&base[eoi..]);
+
+        let mut decoder = JpegDecoder::new(ZCursor::new(&data));
+        let image = <JpegDecoder<_> as DecoderTrait>::decode(&mut decoder).unwrap();
+        assert_eq!(
+            image.metadata.icc_chunk().map(Vec::as_slice),
+            Some(icc_payload.as_slice())
+        );
+        #[cfg(feature = "metadata")]
+        assert!(image.metadata.exif().is_some());
+    }
+}
 // Okay I just need to really appreciate jpeg-encoder crate
 // it's well written and covers quite a lot of things really
 // well, so thank you Volker Ströbel
@@ -112,7 +201,7 @@ impl From<zune_jpeg::errors::DecodeErrors> for ImageErrors {
 /// A simple JPEG encoder
 #[derive(Copy, Clone, Default)]
 pub struct JpegEncoder {
-    options: Option<EncoderOptions>
+    options: Option<EncoderOptions>,
 }
 
 impl JpegEncoder {
@@ -123,7 +212,7 @@ impl JpegEncoder {
     /// Create a new encoder with custom options
     pub fn new_with_options(options: EncoderOptions) -> JpegEncoder {
         JpegEncoder {
-            options: Some(options)
+            options: Some(options),
         }
     }
 }
@@ -134,7 +223,7 @@ impl EncoderTrait for JpegEncoder {
     }
 
     fn encode_inner<T: ZByteWriterTrait>(
-        &mut self, image: &Image, sink: T
+        &mut self, image: &Image, sink: T,
     ) -> Result<usize, ImageErrors> {
         assert_eq!(
             image.depth(),
@@ -203,7 +292,7 @@ impl EncoderTrait for JpegEncoder {
         } else {
             Err(ImgEncodeErrors::UnsupportedColorspace(
                 image.colorspace(),
-                self.supported_colorspaces()
+                self.supported_colorspaces(),
             )
             .into())
         }
@@ -218,7 +307,7 @@ impl EncoderTrait for JpegEncoder {
             ColorSpace::RGBA,
             ColorSpace::YCbCr,
             ColorSpace::YCCK,
-            ColorSpace::CMYK
+            ColorSpace::CMYK,
         ]
     }
 
@@ -248,7 +337,7 @@ const fn match_colorspace_to_colortype(colorspace: ColorSpace) -> Option<ColorTy
         ColorSpace::Luma => Some(ColorType::Luma),
         ColorSpace::YCCK => Some(ColorType::Ycck),
         ColorSpace::CMYK => Some(ColorType::Cmyk),
-        _ => None
+        _ => None,
     }
 }
 
@@ -260,7 +349,7 @@ impl From<EncodingError> for ImageErrors {
 
 impl<T> DecodeInto for JpegDecoder<T>
 where
-    T: ZByteReaderTrait
+    T: ZByteReaderTrait,
 {
     type BufferType = u8;
 
@@ -277,5 +366,179 @@ where
 
         // unwrap is okay because we successfully decoded image headers
         Ok(self.output_buffer_size().unwrap())
+    }
+}
+
+#[cfg(feature = "uhdr")]
+pub mod uhdr {
+    use crate::codecs::ImageFormat;
+    use crate::errors::ImageErrors;
+    use crate::image::Image;
+    use crate::metadata::ImageMetadata;
+    use gainforge::{apply_gain_map_rgb, make_gainmap_weight, GainImage, GainImageMut, IsoGainMap};
+    use moxcms::ColorProfile;
+    use zune_core::bit_depth::BitDepth;
+    use zune_core::bytestream::{ZByteReaderTrait, ZReader};
+    use zune_core::colorspace::ColorSpace;
+    use zune_jpeg::JpegDecoder;
+
+    /// Simple zero-dependency Nearest-Neighbor scaling for 3-channel (RGB) images.
+    /// Replaces `pic_scale`.
+    fn scale_rgb_nearest(
+        src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize,
+    ) -> Vec<u8> {
+        let mut dst = vec![0u8; dst_w * dst_h * 3];
+        for y in 0..dst_h {
+            for x in 0..dst_w {
+                let sx = (x * src_w) / dst_w;
+                let sy = (y * src_h) / dst_h;
+                let src_idx = (sy * src_w + sx) * 3;
+                let dst_idx = (y * dst_w + x) * 3;
+
+                dst[dst_idx] = src[src_idx];
+                dst[dst_idx + 1] = src[src_idx + 1];
+                dst[dst_idx + 2] = src[src_idx + 2];
+            }
+        }
+        dst
+    }
+
+    /// Decodes a JPEG image and applies an Ultra HDR (UHDR) gain map if present.
+    pub fn decode_uhdr_tone_mapped<T: ZByteReaderTrait>(
+        data: T, display_boost: f32,
+    ) -> Result<Image, ImageErrors> {
+        //  Decode Primary Image using ZReader
+        let mut primary_decoder = JpegDecoder::new(data);
+
+        primary_decoder
+            .decode_headers()
+            .map_err(|e| ImageErrors::ImageDecodeErrors(format!("Primary headers: {:?}", e)))?;
+
+        let primary_pixels = primary_decoder
+            .decode()
+            .map_err(|e| ImageErrors::ImageDecodeErrors(format!("Primary decode: {:?}", e)))?;
+
+        let primary_metadata = primary_decoder
+            .info()
+            .ok_or_else(|| ImageErrors::ImageDecodeErrors("No metadata found".to_string()))?;
+
+        let cv = Vec::new();
+        let primary_xmp = primary_decoder.xmp().unwrap_or(&cv);
+
+        let image_icc = primary_decoder
+            .icc_profile()
+            .and_then(|icc| ColorProfile::new_from_slice(&icc).ok());
+
+        let stream = primary_decoder.into_inner();
+
+        let mut map_decoder = JpegDecoder::new(stream);
+        map_decoder
+            .decode_headers()
+            .map_err(|e| ImageErrors::ImageDecodeErrors(format!("Gain map headers: {:?}", e)))?;
+
+        let xmp_data = map_decoder.xmp().map(|x| x.to_vec()).unwrap_or_default();
+
+        let gainmap_info = if let Some(info) = map_decoder.info() {
+            if !info.gain_map_info.is_empty() {
+                info.gain_map_info[0].data.to_vec()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let gain_map_meta = IsoGainMap::from_metadata(&gainmap_info)
+            .or_else(|_| IsoGainMap::from_xml_data(&xmp_data))
+            .map_err(|_| {
+                ImageErrors::ImageDecodeErrors(
+                    "Failed to extract ISO Gain Map metadata".to_string(),
+                )
+            })?;
+
+        let gain_map_icc = map_decoder
+            .icc_profile()
+            .and_then(|icc| ColorProfile::new_from_slice(&icc).ok());
+
+        let mut gain_map_image = map_decoder
+            .decode()
+            .map_err(|e| ImageErrors::ImageDecodeErrors(format!("Gain map decode: {:?}", e)))?;
+
+        let gain_map_image_info = map_decoder
+            .info()
+            .ok_or_else(|| ImageErrors::ImageDecodeErrors("No gain map metadata".to_string()))?;
+
+        // Format gain map components (expand 1 channel to 3)
+        if gain_map_image_info.components == 1 {
+            gain_map_image = gain_map_image.iter().flat_map(|&x| [x, x, x]).collect();
+        }
+
+        //  Scale Gain Map if Dimensions Mismatch
+        if gain_map_image_info.width != primary_metadata.width
+            || gain_map_image_info.height != primary_metadata.height
+        {
+            gain_map_image = scale_rgb_nearest(
+                &gain_map_image,
+                gain_map_image_info.width as usize,
+                gain_map_image_info.height as usize,
+                primary_metadata.width as usize,
+                primary_metadata.height as usize,
+            );
+        }
+
+        // Apply Gain Map for Tone Mapping
+        let gainmap_struct = gain_map_meta.to_gain_map();
+        let gainmap_weight = make_gainmap_weight(gainmap_struct, display_boost);
+
+        let source_gain_img = GainImage::<u8, 3>::borrow(
+            &primary_pixels,
+            primary_metadata.width as usize,
+            primary_metadata.height as usize,
+        );
+        let gain_image_layer = GainImage::<u8, 3>::borrow(
+            &gain_map_image,
+            primary_metadata.width as usize,
+            primary_metadata.height as usize,
+        );
+
+        let mut final_dst = GainImageMut::<u8, 3>::alloc(
+            primary_metadata.width as usize,
+            primary_metadata.height as usize,
+        );
+
+        let dest_profile = ColorProfile::new_srgb();
+
+        apply_gain_map_rgb(
+            &source_gain_img,
+            &image_icc,
+            &mut final_dst,
+            &dest_profile,
+            &gain_image_layer,
+            &gain_map_icc,
+            gainmap_struct,
+            gainmap_weight,
+        )
+        .map_err(|e| ImageErrors::ImageDecodeErrors(format!("Tone map failed: {:?}", e)))?;
+
+        // Wrap in Zune Image Struct
+        let final_pixels = final_dst.data.borrow().to_vec();
+
+        let mut final_image = Image::from_u8(
+            &final_pixels,
+            primary_metadata.width as usize,
+            primary_metadata.height as usize,
+            ColorSpace::RGB,
+        );
+
+        final_image.metadata = ImageMetadata {
+            format: Some(ImageFormat::JPEG),
+            colorspace: ColorSpace::RGB,
+            depth:BitDepth::Eight,
+            width: primary_metadata.width as usize,
+            height: primary_metadata.height as usize,
+            ..Default::default()
+        };
+
+        Ok(final_image)
     }
 }
