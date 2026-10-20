@@ -142,7 +142,9 @@ pub(crate) struct ScanDecodeState {
     pub(crate) scan_start_expects_dnl:     bool,
     pub(crate) append_snapshot:            HeaderAppendStateSnapshot,
     pub(crate) sos_snapshot:               SosParamsSnapshot,
-    pub(crate) header_snapshot:            ScanHeaderStateSnapshot,
+    /// Shared with the plan each `decode_into` makes from this state, so that taking
+    /// one copies no Huffman table (eight of them come to about 28 KiB).
+    pub(crate) header_snapshot:            Arc<ScanHeaderStateSnapshot>,
     pub(crate) scan_checkpoint:            Option<Box<ScanCheckpoint>>,
     pub(crate) progressive_checkpoint:     Option<Box<ProgressiveScanCheckpoint>>,
     pub(crate) progressive_fine_checkpoint: Option<Box<ProgressiveFineCheckpoint>>,
@@ -160,7 +162,7 @@ pub(crate) struct ProgressiveScanCheckpoint {
     pub(crate) stream_position: usize,
     pub(crate) append_snapshot: HeaderAppendStateSnapshot,
     pub(crate) sos_snapshot:    SosParamsSnapshot,
-    pub(crate) header_snapshot: ScanHeaderStateSnapshot,
+    pub(crate) header_snapshot: Arc<ScanHeaderStateSnapshot>,
     pub(crate) completed_scans: usize
 }
 
@@ -204,7 +206,7 @@ pub(crate) struct SosParamsSnapshot {
 #[derive(Clone)]
 pub(crate) struct ScanHeaderStateSnapshot {
     pub(crate) qt_tables:        [Option<[i32; 64]>; MAX_COMPONENTS],
-    pub(crate) entropy_tables:   EntropyTables,
+    pub(crate) entropy_tables:   Box<EntropyTables>,
     pub(crate) restart_interval: usize,
     pub(crate) input_colorspace: ColorSpace,
     pub(crate) adobe_transform:  Option<u8>,
@@ -1216,7 +1218,7 @@ where
     pub(crate) fn capture_scan_header_state(&self) -> ScanHeaderStateSnapshot {
         ScanHeaderStateSnapshot {
             qt_tables:        self.qt_tables,
-            entropy_tables:   self.entropy_tables.clone(),
+            entropy_tables:   Box::new(self.entropy_tables.clone()),
             restart_interval: self.restart_interval,
             input_colorspace: self.input_colorspace,
             adobe_transform:  self.adobe_transform,
@@ -1226,7 +1228,7 @@ where
 
     pub(crate) fn restore_scan_header_state(&mut self, snapshot: &ScanHeaderStateSnapshot) {
         self.qt_tables = snapshot.qt_tables;
-        self.entropy_tables = snapshot.entropy_tables.clone();
+        self.entropy_tables = (*snapshot.entropy_tables).clone();
         self.restart_interval = snapshot.restart_interval;
         self.input_colorspace = snapshot.input_colorspace;
         self.adobe_transform = snapshot.adobe_transform;
@@ -1237,7 +1239,7 @@ where
         let scan_start_position = self.stream_position()?;
         let append_snapshot = HeaderAppendStateSnapshot::capture(self);
         let sos_snapshot = self.capture_sos_params();
-        let header_snapshot = self.capture_scan_header_state();
+        let header_snapshot = Arc::new(self.capture_scan_header_state());
         self.scan_state = Some(Box::new(ScanDecodeState {
             scan_start_position,
             scan_start_height: self.info.height,
@@ -1352,7 +1354,7 @@ where
         let stream_position = self.stream_position()?;
         let append_snapshot = HeaderAppendStateSnapshot::capture(self);
         let sos_snapshot = self.capture_sos_params();
-        let header_snapshot = self.capture_scan_header_state();
+        let header_snapshot = Arc::new(self.capture_scan_header_state());
 
         if let Some(state) = self.scan_state.as_mut() {
             state.progressive_checkpoint = Some(Box::new(ProgressiveScanCheckpoint {
@@ -2766,7 +2768,7 @@ where
             scan_start_expects_dnl: bool,
             outer_append_snapshot: HeaderAppendStateSnapshot,
             outer_sos_snapshot:    SosParamsSnapshot,
-            outer_header_snapshot: ScanHeaderStateSnapshot,
+            outer_header_snapshot: Arc<ScanHeaderStateSnapshot>,
             /// Snapshots taken from the checkpoint (if any) so the seek and
             /// SOS-restore steps below do not need to touch `scan_state`.
             checkpoint_view:       Option<CheckpointView>,
@@ -2786,7 +2788,7 @@ where
         struct ProgressiveCheckpointView {
             append_snapshot: HeaderAppendStateSnapshot,
             sos_snapshot:    SosParamsSnapshot,
-            header_snapshot: ScanHeaderStateSnapshot,
+            header_snapshot: Arc<ScanHeaderStateSnapshot>,
             stream_position: usize,
             completed_scans: usize
         }
