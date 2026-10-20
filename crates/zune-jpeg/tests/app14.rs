@@ -239,10 +239,15 @@ fn ycck_decodes_to_cmyk_without_inverting() {
 }
 
 #[test]
-fn single_component_transform_zero_remains_luma() {
-    let data = include_bytes!("../../../test-images/jpeg/app14/single_component_transform_zero.jpg");
+fn single_component_remains_luma_whatever_the_transform() {
+    let fixture =
+        include_bytes!("../../../test-images/jpeg/app14/single_component_transform_zero.jpg");
 
-    for strict in [false, true] {
+    for (transform, strict) in [0, 1, 2]
+        .into_iter()
+        .flat_map(|transform| [(transform, false), (transform, true)])
+    {
+        let data = with_adobe_transform(fixture, transform);
         let options = DecoderOptions::default()
             .set_strict_mode(strict)
             .jpeg_set_out_colorspace(ColorSpace::Luma);

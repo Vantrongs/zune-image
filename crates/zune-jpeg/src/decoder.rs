@@ -2297,13 +2297,13 @@ where
 
     fn resolve_input_colorspace(&mut self) -> Result<(), DecodeErrors> {
         self.input_colorspace = match self.adobe_transform {
-            Some(0) if self.components.len() == 1 => ColorSpace::Luma,
+            // One component is gray whatever the transform says, as in libjpeg.
+            _ if self.components.len() == 1 => ColorSpace::Luma,
             Some(0) if self.components.len() == 3 => ColorSpace::RGB,
             Some(0) => ColorSpace::CMYK,
             Some(1) => ColorSpace::YCbCr,
             Some(2) => ColorSpace::YCCK,
             Some(_) => unreachable!("APP14 parser rejects unknown transforms"),
-            None if self.components.len() == 1 => ColorSpace::Luma,
             None if self.components.len() == 4 => ColorSpace::CMYK,
             None
                 if self.components.len() == 3
