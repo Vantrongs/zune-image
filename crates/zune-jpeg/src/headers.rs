@@ -12,6 +12,7 @@
 //!
 use alloc::format;
 use alloc::string::ToString;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cmp::max;
 
@@ -137,7 +138,7 @@ where
         // Parse the body in two passes so we never mutate `decoder` if the body
         // turns out to be malformed: first build all tables into a local Vec,
         // then commit them in a tight loop.
-        let mut new_tables: Vec<(u8, usize, HuffmanTable)> = Vec::new();
+        let mut new_tables: Vec<(u8, usize, Arc<HuffmanTable>)> = Vec::new();
         while cursor.remaining() > 16 {
             // HT information
             let ht_info = cursor.read_u8()?;
@@ -180,7 +181,7 @@ where
             } else {
                 HuffmanTable::new(&num_symbols, symbols, dc_or_ac == 0, is_progressive)?
             };
-            new_tables.push((dc_or_ac, index, table));
+            new_tables.push((dc_or_ac, index, Arc::new(table)));
         }
         if cursor.remaining() > 0 {
             return Err(DecodeErrors::FormatStatic("Bogus Huffman table definition"));
@@ -262,12 +263,12 @@ where
         for entry in entries {
             match entry {
                 DacEntry::Dc { index, l, u } => {
-                    let t = &mut decoder.entropy_tables.dc_arithmetic[index];
+                    let t = &mut Arc::make_mut(&mut decoder.entropy_tables.dc_arithmetic)[index];
                     t.l = l;
                     t.u = u;
                 }
                 DacEntry::Ac { index, kx } => {
-                    decoder.entropy_tables.ac_arithmetic[index].kx = kx;
+                    Arc::make_mut(&mut decoder.entropy_tables.ac_arithmetic)[index].kx = kx;
                 }
             }
         }
@@ -330,7 +331,7 @@ pub(crate) fn parse_dqt<T: ZByteReaderTrait>(img: &mut JpegDecoder<T>) -> Result
         }
         // Commit phase.
         for (table_position, dct_table) in new_tables {
-            img.qt_tables[table_position] = Some(dct_table);
+            img.qt_tables[table_position] = Some(Arc::new(dct_table));
         }
         Ok(())
     })

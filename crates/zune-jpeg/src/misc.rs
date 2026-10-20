@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 use alloc::format;
+use alloc::sync::Arc;
 use core::cmp::max;
 use core::fmt;
 
@@ -212,7 +213,7 @@ pub(crate) fn setup_component_params<T: ZByteReaderTrait>(
 
     for component in &mut img.components {
         // Extract quantization tables from the arrays into components
-        let qt_table = *img.qt_tables[component.quantization_table_number as usize]
+        let qt_table = **img.qt_tables[component.quantization_table_number as usize]
             .as_ref()
             .ok_or_else(|| {
                 DecodeErrors::DqtError(format!(
@@ -319,15 +320,15 @@ pub fn calculate_padded_width(actual_width: usize, sub_sample: SampleRatios) -> 
 //  segment to them, or else the decoder won't have any idea how to decompress the data.
 //  The exact table necessary is given in the OpenDML spec.""
 pub fn fill_default_mjpeg_tables(
-    is_progressive: bool, dc_huffman_tables: &mut [Option<HuffmanTable>],
-    ac_huffman_tables: &mut [Option<HuffmanTable>]
+    is_progressive: bool, dc_huffman_tables: &mut [Option<Arc<HuffmanTable>>],
+    ac_huffman_tables: &mut [Option<Arc<HuffmanTable>>]
 ) {
     // Section K.3.3
     trace!("Filling with default mjpeg tables");
 
     if dc_huffman_tables[0].is_none() {
         // Table K.3
-        dc_huffman_tables[0] = Some(
+        dc_huffman_tables[0] = Some(Arc::new(
             HuffmanTable::new_unfilled(
                 &[
                     0x00, 0x00, 0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00,
@@ -340,11 +341,11 @@ pub fn fill_default_mjpeg_tables(
                 is_progressive
             )
             .unwrap()
-        );
+        ));
     }
     if dc_huffman_tables[1].is_none() {
         // Table K.4
-        dc_huffman_tables[1] = Some(
+        dc_huffman_tables[1] = Some(Arc::new(
             HuffmanTable::new_unfilled(
                 &[
                     0x00, 0x00, 0x03, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00,
@@ -357,11 +358,11 @@ pub fn fill_default_mjpeg_tables(
                 is_progressive
             )
             .unwrap()
-        );
+        ));
     }
     if ac_huffman_tables[0].is_none() {
         // Table K.5
-        ac_huffman_tables[0] = Some(
+        ac_huffman_tables[0] = Some(Arc::new(
             HuffmanTable::new_unfilled(
                 &[
                     0x00, 0x00, 0x02, 0x01, 0x03, 0x03, 0x02, 0x04, 0x03, 0x05, 0x05, 0x04, 0x04,
@@ -386,11 +387,11 @@ pub fn fill_default_mjpeg_tables(
                 is_progressive
             )
             .unwrap()
-        );
+        ));
     }
     if ac_huffman_tables[1].is_none() {
         // Table K.6
-        ac_huffman_tables[1] = Some(
+        ac_huffman_tables[1] = Some(Arc::new(
             HuffmanTable::new_unfilled(
                 &[
                     0x00, 0x00, 0x02, 0x01, 0x02, 0x04, 0x04, 0x03, 0x04, 0x07, 0x05, 0x04, 0x04,
@@ -415,6 +416,6 @@ pub fn fill_default_mjpeg_tables(
                 is_progressive
             )
             .unwrap()
-        );
+        ));
     }
 }

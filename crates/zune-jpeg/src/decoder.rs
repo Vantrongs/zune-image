@@ -143,7 +143,7 @@ pub(crate) struct ScanDecodeState {
     pub(crate) append_snapshot:            HeaderAppendStateSnapshot,
     pub(crate) sos_snapshot:               SosParamsSnapshot,
     /// Shared with the plan each `decode_into` makes from this state, so that taking
-    /// one copies no Huffman table (eight of them come to about 28 KiB).
+    /// one counts one reference instead of one per table.
     pub(crate) header_snapshot:            Arc<ScanHeaderStateSnapshot>,
     pub(crate) scan_checkpoint:            Option<Box<ScanCheckpoint>>,
     pub(crate) progressive_checkpoint:     Option<Box<ProgressiveScanCheckpoint>>,
@@ -203,10 +203,12 @@ pub(crate) struct SosParamsSnapshot {
 ///
 /// Inter-scan markers may redefine tables or decode configuration, so replay
 /// must restore the values that were active when scan decoding first began.
+/// The tables are shared with the decoder (see [`EntropyTables`]), so taking and
+/// restoring a snapshot copies none of them.
 #[derive(Clone)]
 pub(crate) struct ScanHeaderStateSnapshot {
-    pub(crate) qt_tables:        [Option<[i32; 64]>; MAX_COMPONENTS],
-    pub(crate) entropy_tables:   Box<EntropyTables>,
+    pub(crate) qt_tables:        [Option<Arc<[i32; 64]>>; MAX_COMPONENTS],
+    pub(crate) entropy_tables:   EntropyTables,
     pub(crate) restart_interval: usize,
     pub(crate) input_colorspace: ColorSpace,
     pub(crate) adobe_transform:  Option<u8>,
@@ -285,18 +287,24 @@ pub(crate) struct ICCChunk {
 }
 
 // A separate struct to allow &borrowing tables while &mut borrowing components
+//
+// Every table here and in `JpegDecoder::qt_tables` sits behind an `Arc` so that
+// the scan's header snapshots share it with the decoder (eight Huffman tables come
+// to about 28 KiB, and a decode takes a snapshot at SOS and restores it): a DHT or
+// DQT puts a new table in its slot, and arithmetic decoding writes its statistics
+// through `Arc::make_mut`, which copies them only while a snapshot holds them.
 #[derive(Clone)]
 pub(crate) struct EntropyTables {
     /// DC Huffman Tables with a maximum of 4 tables for each  component
-    pub(crate) dc_huffman:    [Option<HuffmanTable>; MAX_COMPONENTS],
+    pub(crate) dc_huffman:    [Option<Arc<HuffmanTable>>; MAX_COMPONENTS],
     /// AC Huffman Tables with a maximum of 4 tables for each component
-    pub(crate) ac_huffman:    [Option<HuffmanTable>; MAX_COMPONENTS],
+    pub(crate) ac_huffman:    [Option<Arc<HuffmanTable>>; MAX_COMPONENTS],
     /// Arithmetic coding initial conditioning parameters and statistics (has a default value)
     #[cfg(feature = "arith")]
-    pub(crate) dc_arithmetic: [ArithDCTables; MAX_COMPONENTS],
+    pub(crate) dc_arithmetic: Arc<[ArithDCTables; MAX_COMPONENTS]>,
     /// Arithmetic coding initial conditioning parameters and statistics  (has a default value)
     #[cfg(feature = "arith")]
-    pub(crate) ac_arithmetic: [ArithACTables; MAX_COMPONENTS]
+    pub(crate) ac_arithmetic: Arc<[ArithACTables; MAX_COMPONENTS]>
 }
 
 /// A JPEG Decoder Instance.
@@ -306,7 +314,7 @@ pub struct JpegDecoder<T> {
     pub(crate) info:             ImageInfo,
     ///  Quantization tables, will be set to none and the tables will
     /// be moved to `components` field
-    pub(crate) qt_tables:        [Option<[i32; 64]>; MAX_COMPONENTS],
+    pub(crate) qt_tables:        [Option<Arc<[i32; 64]>>; MAX_COMPONENTS],
     // Entropy coding tables
     pub(crate) entropy_tables:   EntropyTables,
     /// Image components, holds information like DC prediction and quantization
@@ -1217,8 +1225,8 @@ where
 
     pub(crate) fn capture_scan_header_state(&self) -> ScanHeaderStateSnapshot {
         ScanHeaderStateSnapshot {
-            qt_tables:        self.qt_tables,
-            entropy_tables:   Box::new(self.entropy_tables.clone()),
+            qt_tables:        self.qt_tables.clone(),
+            entropy_tables:   self.entropy_tables.clone(),
             restart_interval: self.restart_interval,
             input_colorspace: self.input_colorspace,
             adobe_transform:  self.adobe_transform,
@@ -1227,8 +1235,8 @@ where
     }
 
     pub(crate) fn restore_scan_header_state(&mut self, snapshot: &ScanHeaderStateSnapshot) {
-        self.qt_tables = snapshot.qt_tables;
-        self.entropy_tables = (*snapshot.entropy_tables).clone();
+        self.qt_tables.clone_from(&snapshot.qt_tables);
+        self.entropy_tables.clone_from(&snapshot.entropy_tables);
         self.restart_interval = snapshot.restart_interval;
         self.input_colorspace = snapshot.input_colorspace;
         self.adobe_transform = snapshot.adobe_transform;
@@ -1512,19 +1520,19 @@ where
                 dc_huffman: [None, None, None, None],
                 ac_huffman: [None, None, None, None],
                 #[cfg(feature = "arith")]
-                dc_arithmetic: [
+                dc_arithmetic: Arc::new([
                     ArithDCTables::default(),
                     ArithDCTables::default(),
                     ArithDCTables::default(),
                     ArithDCTables::default()
-                ],
+                ]),
                 #[cfg(feature = "arith")]
-                ac_arithmetic: [
+                ac_arithmetic: Arc::new([
                     ArithACTables::default(),
                     ArithACTables::default(),
                     ArithACTables::default(),
                     ArithACTables::default()
-                ]
+                ])
             },
             components:        vec![],
             // Interleaved information
@@ -2961,7 +2969,7 @@ where
             // Components take their quantization tables once, from the tables in
             // effect at the first SOS (`setup_component_params`). A DQT between
             // later scans must not change them when resuming from a later checkpoint.
-            self.qt_tables = outer_header_snapshot.qt_tables;
+            self.qt_tables.clone_from(&outer_header_snapshot.qt_tables);
             if checkpoint_view.is_none() && !had_progressive_view {
                 // First-SOS replay restarts progressive coefficient assembly;
                 // scan-boundary retries restore `todo` in `parse_entropy_coded_data`.

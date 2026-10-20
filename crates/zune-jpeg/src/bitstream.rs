@@ -48,6 +48,7 @@
 //! Knock yourself out.
 use alloc::format;
 use alloc::string::ToString;
+use alloc::sync::Arc;
 use core::cmp::min;
 
 use zune_core::bytestream::{ZByteReaderTrait, ZReader};
@@ -404,8 +405,9 @@ impl BitStreamHuffman {
 
 impl BitStream for BitStreamHuffman {
     type State = HuffmanBitstreamState;
-    type DCEntropyTable = HuffmanTable;
-    type ACEntropyTable = HuffmanTable;
+    // Shared with the scan's header snapshots: decoding only reads a Huffman table.
+    type DCEntropyTable = Arc<HuffmanTable>;
+    type ACEntropyTable = Arc<HuffmanTable>;
 
     #[inline(always)]
     fn get_dc_table(
@@ -751,13 +753,14 @@ impl BitStream for BitStreamHuffman {
     )]
     #[inline(never)]
     fn decode_mcu_block<T>(
-        &mut self, reader: &mut ZReader<T>, dc_table: &mut HuffmanTable,
-        ac_table: &mut HuffmanTable, qt_table: &[i32; DCT_BLOCK], block: &mut [i32; 64],
+        &mut self, reader: &mut ZReader<T>, dc_table: &mut Arc<HuffmanTable>,
+        ac_table: &mut Arc<HuffmanTable>, qt_table: &[i32; DCT_BLOCK], block: &mut [i32; 64],
         dc_prediction: &mut i32, _last_dc_diff: &mut i32
     ) -> Result<u16, DecodeErrors>
     where
         T: ZByteReaderTrait
     {
+        let (dc_table, ac_table): (&HuffmanTable, &HuffmanTable) = (dc_table, ac_table);
         // Get fast AC table as a reference before we enter the hot path
         let ac_lookup = ac_table.ac_lookup.as_ref().unwrap();
 
@@ -820,12 +823,13 @@ impl BitStream for BitStreamHuffman {
     /// This updates DC prediction but we never dequantize and we never do any Zig-Zag translation
     /// either. Still returns the index of the last component read.
     fn discard_mcu_block<T>(
-        &mut self, reader: &mut ZReader<T>, dc_table: &mut HuffmanTable,
-        ac_table: &mut HuffmanTable, _last_dc_diff: &mut i32
+        &mut self, reader: &mut ZReader<T>, dc_table: &mut Arc<HuffmanTable>,
+        ac_table: &mut Arc<HuffmanTable>, _last_dc_diff: &mut i32
     ) -> Result<u16, DecodeErrors>
     where
         T: ZByteReaderTrait
     {
+        let (dc_table, ac_table): (&HuffmanTable, &HuffmanTable) = (dc_table, ac_table);
         // Get fast AC table as a reference before we enter the hot path
         let ac_lookup = ac_table.ac_lookup.as_ref().unwrap();
 
@@ -878,7 +882,7 @@ impl BitStream for BitStreamHuffman {
     #[allow(clippy::cast_possible_truncation)]
     #[inline]
     fn decode_prog_dc_first<T>(
-        &mut self, reader: &mut ZReader<T>, dc_table: &mut HuffmanTable, block: &mut i16,
+        &mut self, reader: &mut ZReader<T>, dc_table: &mut Arc<HuffmanTable>, block: &mut i16,
         dc_prediction: &mut i32, _last_dc_diff: &mut i32
     ) -> Result<(), DecodeErrors>
     where
@@ -915,11 +919,13 @@ impl BitStream for BitStreamHuffman {
     }
 
     fn decode_mcu_ac_first<T>(
-        &mut self, reader: &mut ZReader<T>, ac_table: &mut HuffmanTable, block: &mut [i16; 64]
+        &mut self, reader: &mut ZReader<T>, ac_table: &mut Arc<HuffmanTable>,
+        block: &mut [i16; 64]
     ) -> Result<bool, DecodeErrors>
     where
         T: ZByteReaderTrait
     {
+        let ac_table: &HuffmanTable = ac_table;
         let fast_ac = ac_table.ac_lookup.as_ref().unwrap();
         let bit = self.successive_low_mask;
 
@@ -973,11 +979,12 @@ impl BitStream for BitStreamHuffman {
     }
     #[allow(clippy::too_many_lines, clippy::op_ref)]
     fn decode_mcu_ac_refine<T>(
-        &mut self, reader: &mut ZReader<T>, table: &mut HuffmanTable, block: &mut [i16; 64]
+        &mut self, reader: &mut ZReader<T>, table: &mut Arc<HuffmanTable>, block: &mut [i16; 64]
     ) -> Result<bool, DecodeErrors>
     where
         T: ZByteReaderTrait
     {
+        let table: &HuffmanTable = table;
         let bit = self.successive_low_mask;
 
         let mut k = self.spec_start;
