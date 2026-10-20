@@ -1,0 +1,18 @@
+[package]
+name = "zune-jpeg-corpus-diff"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Decodes every JPEG in a directory with two zune-jpeg revisions and lists those whose
+# pixels or errors differ; corpus.py extracts the JPEGs from PDFs and compares the
+# differences with MuPDF. Not part of the workspace or CI.
+[dependencies]
+# The revision to compare against: the fork before it merged upstream's 0.5.16 line.
+old = { package = "zune-jpeg", git = "https://github.com/Vantrongs/zune-image", rev = "d8686cc29483a83c84ba681d6b7467fd3545e616" }
+new = { package = "zune-jpeg", path = ".." }
+
+[profile.release]
+debug = 1
+
+[workspace]
