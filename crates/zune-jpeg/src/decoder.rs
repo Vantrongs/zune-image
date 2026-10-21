@@ -37,7 +37,7 @@ use crate::headers::{
     parse_app1, parse_app13, parse_app14, parse_app2, parse_dqt, parse_huffman, parse_sos,
     parse_start_of_frame, with_marker_body
 };
-use crate::huffman::HuffmanTable;
+use crate::huffman::{HuffmanSnapshot, HuffmanTables};
 use crate::idct::{choose_idct_1x1_func, choose_idct_4x4_func, choose_idct_func};
 use crate::marker::Marker;
 use crate::misc::SOFMarkers;
@@ -142,9 +142,7 @@ pub(crate) struct ScanDecodeState {
     pub(crate) scan_start_expects_dnl:     bool,
     pub(crate) append_snapshot:            HeaderAppendStateSnapshot,
     pub(crate) sos_snapshot:               SosParamsSnapshot,
-    /// Shared with the plan each `decode_into` makes from this state, so that taking
-    /// one counts one reference instead of one per table.
-    pub(crate) header_snapshot:            Arc<ScanHeaderStateSnapshot>,
+    pub(crate) header_snapshot:            ScanHeaderStateSnapshot,
     pub(crate) scan_checkpoint:            Option<Box<ScanCheckpoint>>,
     pub(crate) progressive_checkpoint:     Option<Box<ProgressiveScanCheckpoint>>,
     pub(crate) progressive_fine_checkpoint: Option<Box<ProgressiveFineCheckpoint>>,
@@ -162,7 +160,7 @@ pub(crate) struct ProgressiveScanCheckpoint {
     pub(crate) stream_position: usize,
     pub(crate) append_snapshot: HeaderAppendStateSnapshot,
     pub(crate) sos_snapshot:    SosParamsSnapshot,
-    pub(crate) header_snapshot: Arc<ScanHeaderStateSnapshot>,
+    pub(crate) header_snapshot: ScanHeaderStateSnapshot,
     pub(crate) completed_scans: usize
 }
 
@@ -203,12 +201,14 @@ pub(crate) struct SosParamsSnapshot {
 ///
 /// Inter-scan markers may redefine tables or decode configuration, so replay
 /// must restore the values that were active when scan decoding first began.
-/// The tables are shared with the decoder (see [`EntropyTables`]), so taking and
-/// restoring a snapshot copies none of them.
+/// The Huffman tables stay with the decoder (see [`HuffmanTables`]) and the
+/// arithmetic statistics are shared with it, so taking and restoring a snapshot
+/// copies only the quantization tables.
 #[derive(Clone)]
 pub(crate) struct ScanHeaderStateSnapshot {
-    pub(crate) qt_tables:        [Option<Arc<[i32; 64]>>; MAX_COMPONENTS],
-    pub(crate) entropy_tables:   EntropyTables,
+    pub(crate) qt_tables:        [Option<[i32; 64]>; MAX_COMPONENTS],
+    pub(crate) huffman:          HuffmanSnapshot,
+    pub(crate) arith:            ArithStats,
     pub(crate) restart_interval: usize,
     pub(crate) input_colorspace: ColorSpace,
     pub(crate) adobe_transform:  Option<u8>,
@@ -287,24 +287,25 @@ pub(crate) struct ICCChunk {
 }
 
 // A separate struct to allow &borrowing tables while &mut borrowing components
-//
-// Every table here and in `JpegDecoder::qt_tables` sits behind an `Arc` so that
-// the scan's header snapshots share it with the decoder (eight Huffman tables come
-// to about 28 KiB, and a decode takes a snapshot at SOS and restores it): a DHT or
-// DQT puts a new table in its slot, and arithmetic decoding writes its statistics
-// through `Arc::make_mut`, which copies them only while a snapshot holds them.
-#[derive(Clone)]
 pub(crate) struct EntropyTables {
-    /// DC Huffman Tables with a maximum of 4 tables for each  component
-    pub(crate) dc_huffman:    [Option<Arc<HuffmanTable>>; MAX_COMPONENTS],
-    /// AC Huffman Tables with a maximum of 4 tables for each component
-    pub(crate) ac_huffman:    [Option<Arc<HuffmanTable>>; MAX_COMPONENTS],
+    /// DC and AC Huffman tables, a maximum of 4 of each
+    pub(crate) huffman: HuffmanTables,
+    pub(crate) arith:   ArithStats
+}
+
+/// Arithmetic coding conditioning parameters and statistics.
+///
+/// They sit behind an `Arc` so that the scan's header snapshots share them with
+/// the decoder: arithmetic decoding writes them through `Arc::make_mut`, which
+/// copies them only while a snapshot holds them.
+#[derive(Clone)]
+pub(crate) struct ArithStats {
     /// Arithmetic coding initial conditioning parameters and statistics (has a default value)
     #[cfg(feature = "arith")]
-    pub(crate) dc_arithmetic: Arc<[ArithDCTables; MAX_COMPONENTS]>,
+    pub(crate) dc: Arc<[ArithDCTables; MAX_COMPONENTS]>,
     /// Arithmetic coding initial conditioning parameters and statistics  (has a default value)
     #[cfg(feature = "arith")]
-    pub(crate) ac_arithmetic: Arc<[ArithACTables; MAX_COMPONENTS]>
+    pub(crate) ac: Arc<[ArithACTables; MAX_COMPONENTS]>
 }
 
 /// A JPEG Decoder Instance.
@@ -314,7 +315,7 @@ pub struct JpegDecoder<T> {
     pub(crate) info:             ImageInfo,
     ///  Quantization tables, will be set to none and the tables will
     /// be moved to `components` field
-    pub(crate) qt_tables:        [Option<Arc<[i32; 64]>>; MAX_COMPONENTS],
+    pub(crate) qt_tables:        [Option<[i32; 64]>; MAX_COMPONENTS],
     // Entropy coding tables
     pub(crate) entropy_tables:   EntropyTables,
     /// Image components, holds information like DC prediction and quantization
@@ -580,7 +581,7 @@ struct RawPullState {
     owner:                    RawPullOwner,
     phase:                    RawPullPhase,
     next_stripe:              usize,
-    entropy_tables:           Option<Box<EntropyTables>>,
+    arith_stats:              Option<ArithStats>,
     layout:                   Option<[PlaneInfo; MAX_COMPONENTS]>,
     rows_per_stripe:          [usize; MAX_COMPONENTS],
     buffered_source_complete: bool
@@ -599,7 +600,7 @@ impl Default for RawPullState {
             owner:                    RawPullOwner::None,
             phase:                    RawPullPhase::Start,
             next_stripe:              0,
-            entropy_tables:           None,
+            arith_stats:              None,
             layout:                   None,
             rows_per_stripe:          [0; MAX_COMPONENTS],
             buffered_source_complete: false
@@ -831,8 +832,8 @@ where
         if self.decoder.raw_pull_state.phase == RawPullPhase::StreamingBaseline
             && self.decoder.is_arithmetic
         {
-            self.decoder.raw_pull_state.entropy_tables =
-                Some(Box::new(self.decoder.entropy_tables.clone()));
+            self.decoder.raw_pull_state.arith_stats =
+                Some(self.decoder.entropy_tables.arith.clone());
         }
         Ok(RawImcuRowStatus::RowReady {
             rows_written: sink.rows_written
@@ -968,15 +969,15 @@ where
             None => false
         };
         if resumes_completed_row {
-            let tables = self
+            let stats = self
                 .decoder
                 .raw_pull_state
-                .entropy_tables
+                .arith_stats
                 .as_ref()
                 .ok_or(DecodeErrors::FormatStatic(
                     "missing arithmetic contexts for raw iMCU-row resume"
                 ))?;
-            self.decoder.entropy_tables = tables.as_ref().clone();
+            self.decoder.entropy_tables.arith = stats.clone();
         }
         Ok(())
     }
@@ -1223,10 +1224,11 @@ where
         }
     }
 
-    pub(crate) fn capture_scan_header_state(&self) -> ScanHeaderStateSnapshot {
+    pub(crate) fn capture_scan_header_state(&mut self) -> ScanHeaderStateSnapshot {
         ScanHeaderStateSnapshot {
-            qt_tables:        self.qt_tables.clone(),
-            entropy_tables:   self.entropy_tables.clone(),
+            qt_tables:        self.qt_tables,
+            huffman:          self.entropy_tables.huffman.snapshot(),
+            arith:            self.entropy_tables.arith.clone(),
             restart_interval: self.restart_interval,
             input_colorspace: self.input_colorspace,
             adobe_transform:  self.adobe_transform,
@@ -1234,20 +1236,24 @@ where
         }
     }
 
-    pub(crate) fn restore_scan_header_state(&mut self, snapshot: &ScanHeaderStateSnapshot) {
-        self.qt_tables.clone_from(&snapshot.qt_tables);
-        self.entropy_tables.clone_from(&snapshot.entropy_tables);
+    pub(crate) fn restore_scan_header_state(
+        &mut self, snapshot: &ScanHeaderStateSnapshot
+    ) -> Result<(), DecodeErrors> {
+        self.entropy_tables.huffman.restore(&snapshot.huffman)?;
+        self.qt_tables = snapshot.qt_tables;
+        self.entropy_tables.arith.clone_from(&snapshot.arith);
         self.restart_interval = snapshot.restart_interval;
         self.input_colorspace = snapshot.input_colorspace;
         self.adobe_transform = snapshot.adobe_transform;
         self.is_mjpeg = snapshot.is_mjpeg;
+        Ok(())
     }
 
     fn enter_scan_state(&mut self) -> Result<(), DecodeErrors> {
         let scan_start_position = self.stream_position()?;
         let append_snapshot = HeaderAppendStateSnapshot::capture(self);
         let sos_snapshot = self.capture_sos_params();
-        let header_snapshot = Arc::new(self.capture_scan_header_state());
+        let header_snapshot = self.capture_scan_header_state();
         self.scan_state = Some(Box::new(ScanDecodeState {
             scan_start_position,
             scan_start_height: self.info.height,
@@ -1362,7 +1368,7 @@ where
         let stream_position = self.stream_position()?;
         let append_snapshot = HeaderAppendStateSnapshot::capture(self);
         let sos_snapshot = self.capture_sos_params();
-        let header_snapshot = Arc::new(self.capture_scan_header_state());
+        let header_snapshot = self.capture_scan_header_state();
 
         if let Some(state) = self.scan_state.as_mut() {
             state.progressive_checkpoint = Some(Box::new(ProgressiveScanCheckpoint {
@@ -1513,26 +1519,33 @@ where
     #[allow(clippy::redundant_field_names)]
     fn default(options: DecoderOptions, buffer: T) -> Self {
         let color_convert = choose_ycbcr_to_rgb_convert_func(ColorSpace::RGB, &options).unwrap();
+        // Chosen before the struct is built so that nothing called while building it
+        // can unwind: the compiler then writes the Huffman slots' tags in place instead
+        // of building `entropy_tables` (about 28 KiB) aside and copying it in.
+        let idct_func = choose_idct_func(&options);
+        let idct_4x4_func = choose_idct_4x4_func(&options);
+        let idct_1x1_func = choose_idct_1x1_func(&options);
         JpegDecoder {
             info:                  ImageInfo::default(),
             qt_tables:             [None, None, None, None],
             entropy_tables:        EntropyTables {
-                dc_huffman: [None, None, None, None],
-                ac_huffman: [None, None, None, None],
-                #[cfg(feature = "arith")]
-                dc_arithmetic: Arc::new([
-                    ArithDCTables::default(),
-                    ArithDCTables::default(),
-                    ArithDCTables::default(),
-                    ArithDCTables::default()
-                ]),
-                #[cfg(feature = "arith")]
-                ac_arithmetic: Arc::new([
-                    ArithACTables::default(),
-                    ArithACTables::default(),
-                    ArithACTables::default(),
-                    ArithACTables::default()
-                ])
+                huffman: HuffmanTables::new(),
+                arith:   ArithStats {
+                    #[cfg(feature = "arith")]
+                    dc: Arc::new([
+                        ArithDCTables::default(),
+                        ArithDCTables::default(),
+                        ArithDCTables::default(),
+                        ArithDCTables::default()
+                    ]),
+                    #[cfg(feature = "arith")]
+                    ac: Arc::new([
+                        ArithACTables::default(),
+                        ArithACTables::default(),
+                        ArithACTables::default(),
+                        ArithACTables::default()
+                    ])
+                }
             },
             components:        vec![],
             // Interleaved information
@@ -1551,9 +1564,9 @@ where
             succ_low:                    0,
             num_scans:                   0,
             scan_subsampled:             false,
-            idct_func:                   choose_idct_func(&options),
-            idct_4x4_func:               choose_idct_4x4_func(&options),
-            idct_1x1_func:               choose_idct_1x1_func(&options),
+            idct_func:                   idct_func,
+            idct_4x4_func:               idct_4x4_func,
+            idct_1x1_func:               idct_1x1_func,
             color_convert_16:            color_convert,
             input_colorspace:            ColorSpace::YCbCr,
             adobe_transform:             None,
@@ -2776,7 +2789,7 @@ where
             scan_start_expects_dnl: bool,
             outer_append_snapshot: HeaderAppendStateSnapshot,
             outer_sos_snapshot:    SosParamsSnapshot,
-            outer_header_snapshot: Arc<ScanHeaderStateSnapshot>,
+            outer_header_snapshot: ScanHeaderStateSnapshot,
             /// Snapshots taken from the checkpoint (if any) so the seek and
             /// SOS-restore steps below do not need to touch `scan_state`.
             checkpoint_view:       Option<CheckpointView>,
@@ -2796,7 +2809,7 @@ where
         struct ProgressiveCheckpointView {
             append_snapshot: HeaderAppendStateSnapshot,
             sos_snapshot:    SosParamsSnapshot,
-            header_snapshot: Arc<ScanHeaderStateSnapshot>,
+            header_snapshot: ScanHeaderStateSnapshot,
             stream_position: usize,
             completed_scans: usize
         }
@@ -2911,7 +2924,7 @@ where
                 let header_snapshot = progressive_view
                     .as_ref()
                     .map_or(&outer_header_snapshot, |view| &view.header_snapshot);
-                self.restore_scan_header_state(header_snapshot);
+                self.restore_scan_header_state(header_snapshot)?;
                 self.stream.set_position(view.stream_position)?;
                 self.progressive_completed_scans = view.completed_scans;
                 self.progressive_displayed_scans =
@@ -2924,7 +2937,7 @@ where
                     comp.dc_diff = dc_diff;
                 }
             } else if let Some(view) = progressive_view {
-                self.restore_scan_header_state(&view.header_snapshot);
+                self.restore_scan_header_state(&view.header_snapshot)?;
                 self.stream.set_position(view.stream_position)?;
                 self.progressive_completed_scans = view.completed_scans;
                 self.progressive_displayed_scans =
@@ -2947,7 +2960,7 @@ where
                     comp.dc_diff = dc_diff;
                 }
             } else {
-                self.restore_scan_header_state(&outer_header_snapshot);
+                self.restore_scan_header_state(&outer_header_snapshot)?;
                 self.stream.set_position(scan_start_position)?;
                 self.pixels_decoded = 0;
                 if self.is_progressive {
@@ -2969,7 +2982,7 @@ where
             // Components take their quantization tables once, from the tables in
             // effect at the first SOS (`setup_component_params`). A DQT between
             // later scans must not change them when resuming from a later checkpoint.
-            self.qt_tables.clone_from(&outer_header_snapshot.qt_tables);
+            self.qt_tables = outer_header_snapshot.qt_tables;
             if checkpoint_view.is_none() && !had_progressive_view {
                 // First-SOS replay restarts progressive coefficient assembly;
                 // scan-boundary retries restore `todo` in `parse_entropy_coded_data`.

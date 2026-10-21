@@ -12,6 +12,7 @@
 //!
 use alloc::format;
 use alloc::string::ToString;
+#[cfg(feature = "arith")]
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cmp::max;
@@ -22,10 +23,15 @@ use zune_core::log::{trace, warn};
 use crate::components::{Components, SampleRatios};
 use crate::decoder::{ExtendedXmpSegment, GainMapInfo, ICCChunk, JpegDecoder, MAX_COMPONENTS};
 use crate::errors::DecodeErrors;
-use crate::huffman::HuffmanTable;
+use crate::huffman::TableClass;
 use crate::misc::{SOFMarkers, UN_ZIGZAG};
 
 const MARKER_BODY_CANCEL_CHUNK_SIZE: usize = 4096;
+/// Marker bodies up to this length are read into a stack buffer instead of the
+/// decoder's scratch `Vec`: the table, frame, scan and APP0/APP14 markers of every
+/// JPEG in hayro's test corpus fit, so decoding such an image allocates nothing for
+/// its markers.
+const INLINE_MARKER_BODY: usize = 1024;
 
 /// Wrapper over a marker body that exposes a cursor-style read API.
 ///
@@ -81,8 +87,9 @@ impl<'a> MarkerBody<'a> {
     }
 }
 
-/// Read a length-prefixed marker body using the decoder's reusable scratch
-/// buffer, then parse it inside a lexical scope.
+/// Read a length-prefixed marker body, on the stack when it fits
+/// [`INLINE_MARKER_BODY`] and otherwise in the decoder's reusable scratch buffer,
+/// then parse it inside a lexical scope.
 ///
 /// The length field and payload are consumed before the closure runs. If the
 /// input ends mid-marker, the decoder state is untouched and the scratch
@@ -101,28 +108,26 @@ where
         .checked_sub(2)
         .ok_or(DecodeErrors::FormatStatic("Marker length < 2"))?;
 
-    let mut bytes = core::mem::take(&mut decoder.marker_body_scratch);
-    bytes.clear();
-    bytes.resize(body_len, 0);
-
-    for (chunk_index, chunk) in bytes.chunks_mut(MARKER_BODY_CANCEL_CHUNK_SIZE).enumerate() {
-        if chunk_index > 0 {
-            if let Err(error) = decoder.check_cancelled() {
-                bytes.clear();
-                decoder.marker_body_scratch = bytes;
-                return Err(error);
+    let mut inline = [0_u8; INLINE_MARKER_BODY];
+    let mut scratch = core::mem::take(&mut decoder.marker_body_scratch);
+    let result = (|| {
+        let bytes = if body_len <= INLINE_MARKER_BODY {
+            &mut inline[..body_len]
+        } else {
+            scratch.clear();
+            scratch.resize(body_len, 0);
+            &mut scratch[..]
+        };
+        for (chunk_index, chunk) in bytes.chunks_mut(MARKER_BODY_CANCEL_CHUNK_SIZE).enumerate() {
+            if chunk_index > 0 {
+                decoder.check_cancelled()?;
             }
+            decoder.stream.read_exact_bytes(chunk)?;
         }
-        if let Err(error) = decoder.stream.read_exact_bytes(chunk) {
-            bytes.clear();
-            decoder.marker_body_scratch = bytes;
-            return Err(error.into());
-        }
-    }
-
-    let result = parse(decoder, MarkerBody::new(&bytes));
-    bytes.clear();
-    decoder.marker_body_scratch = bytes;
+        parse(decoder, MarkerBody::new(bytes))
+    })();
+    scratch.clear();
+    decoder.marker_body_scratch = scratch;
     result
 }
 
@@ -135,66 +140,73 @@ where
 {
     with_marker_body(decoder, |decoder, mut cursor| {
         let is_progressive = decoder.is_progressive;
-        // Parse the body in two passes so we never mutate `decoder` if the body
-        // turns out to be malformed: first build all tables into a local Vec,
-        // then commit them in a tight loop.
-        let mut new_tables: Vec<(u8, usize, Arc<HuffmanTable>)> = Vec::new();
-        while cursor.remaining() > 16 {
-            // HT information
-            let ht_info = cursor.read_u8()?;
-            // third bit indicates whether the huffman encoding is DC or AC type
-            let dc_or_ac = (ht_info >> 4) & 0xF;
-            // Indicate the position of this table, should be less than 4;
-            let index = (ht_info & 0xF) as usize;
-            if index >= MAX_COMPONENTS {
-                return Err(DecodeErrors::HuffmanDecode(format!(
-                    "Invalid DHT index {index}, expected between 0 and 3"
-                )));
+        let lossless_dc = !decoder.seen_sof || decoder.info.sof.is_lossless();
+        // `define` leaves the tables alone if the body turns out to be malformed.
+        decoder.entropy_tables.huffman.define(|tables| {
+            while cursor.remaining() > 16 {
+                // HT information
+                let ht_info = cursor.read_u8()?;
+                // third bit indicates whether the huffman encoding is DC or AC type
+                let dc_or_ac = (ht_info >> 4) & 0xF;
+                // Indicate the position of this table, should be less than 4;
+                let index = (ht_info & 0xF) as usize;
+                if index >= MAX_COMPONENTS {
+                    return Err(DecodeErrors::HuffmanDecode(format!(
+                        "Invalid DHT index {index}, expected between 0 and 3"
+                    )));
+                }
+                if dc_or_ac > 1 {
+                    return Err(DecodeErrors::HuffmanDecode(format!(
+                        "Invalid DHT position {dc_or_ac}, should be 0 or 1"
+                    )));
+                }
+                // read the code-length histogram
+                let mut num_symbols: [u8; 17] = [0; 17];
+                cursor.read_exact(&mut num_symbols[1..17])?;
+                let symbols_sum: i32 = num_symbols.iter().map(|f| i32::from(*f)).sum();
+                if symbols_sum > 256 {
+                    return Err(DecodeErrors::FormatStatic(
+                        "Encountered Huffman table with excessive length in DHT"
+                    ));
+                }
+                if symbols_sum as usize > cursor.remaining() {
+                    return Err(DecodeErrors::HuffmanDecode(format!(
+                        "Excessive Huffman table of length {symbols_sum} found when remaining bytes is {}",
+                        cursor.remaining()
+                    )));
+                }
+                // symbols in increasing code length
+                let mut symbols = [0; 256];
+                cursor.read_exact(&mut symbols[0..(symbols_sum as usize)])?;
+                if dc_or_ac == 0 {
+                    // Before the frame header, or in a lossless frame, a DC table may
+                    // code 16-bit differences.
+                    let (progressive, limit) =
+                        if lossless_dc { (false, 16) } else { (is_progressive, 15) };
+                    tables.define(
+                        TableClass::Dc,
+                        index,
+                        &num_symbols,
+                        &symbols,
+                        progressive,
+                        limit
+                    )?;
+                } else {
+                    tables.define(
+                        TableClass::Ac,
+                        index,
+                        &num_symbols,
+                        &symbols,
+                        is_progressive,
+                        15
+                    )?;
+                }
             }
-            if dc_or_ac > 1 {
-                return Err(DecodeErrors::HuffmanDecode(format!(
-                    "Invalid DHT position {dc_or_ac}, should be 0 or 1"
-                )));
+            if cursor.remaining() > 0 {
+                return Err(DecodeErrors::FormatStatic("Bogus Huffman table definition"));
             }
-            // read the code-length histogram
-            let mut num_symbols: [u8; 17] = [0; 17];
-            cursor.read_exact(&mut num_symbols[1..17])?;
-            let symbols_sum: i32 = num_symbols.iter().map(|f| i32::from(*f)).sum();
-            if symbols_sum > 256 {
-                return Err(DecodeErrors::FormatStatic(
-                    "Encountered Huffman table with excessive length in DHT"
-                ));
-            }
-            if symbols_sum as usize > cursor.remaining() {
-                return Err(DecodeErrors::HuffmanDecode(format!(
-                    "Excessive Huffman table of length {symbols_sum} found when remaining bytes is {}",
-                    cursor.remaining()
-                )));
-            }
-            // symbols in increasing code length
-            let mut symbols = [0; 256];
-            cursor.read_exact(&mut symbols[0..(symbols_sum as usize)])?;
-            let table = if dc_or_ac == 0
-                && (!decoder.seen_sof || decoder.info.sof.is_lossless())
-            {
-                HuffmanTable::new_lossless(&num_symbols, symbols)?
-            } else {
-                HuffmanTable::new(&num_symbols, symbols, dc_or_ac == 0, is_progressive)?
-            };
-            new_tables.push((dc_or_ac, index, Arc::new(table)));
-        }
-        if cursor.remaining() > 0 {
-            return Err(DecodeErrors::FormatStatic("Bogus Huffman table definition"));
-        }
-        // Commit phase: only after the entire body parsed cleanly.
-        for (dc_or_ac, index, table) in new_tables {
-            if dc_or_ac == 0 {
-                decoder.entropy_tables.dc_huffman[index] = Some(table);
-            } else {
-                decoder.entropy_tables.ac_huffman[index] = Some(table);
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     })
 }
 
@@ -263,12 +275,12 @@ where
         for entry in entries {
             match entry {
                 DacEntry::Dc { index, l, u } => {
-                    let t = &mut Arc::make_mut(&mut decoder.entropy_tables.dc_arithmetic)[index];
+                    let t = &mut Arc::make_mut(&mut decoder.entropy_tables.arith.dc)[index];
                     t.l = l;
                     t.u = u;
                 }
                 DacEntry::Ac { index, kx } => {
-                    Arc::make_mut(&mut decoder.entropy_tables.ac_arithmetic)[index].kx = kx;
+                    Arc::make_mut(&mut decoder.entropy_tables.arith.ac)[index].kx = kx;
                 }
             }
         }
@@ -280,9 +292,9 @@ where
 #[allow(clippy::cast_possible_truncation, clippy::needless_range_loop)]
 pub(crate) fn parse_dqt<T: ZByteReaderTrait>(img: &mut JpegDecoder<T>) -> Result<(), DecodeErrors> {
     with_marker_body(img, |img, mut cursor| {
-        // Build the new tables into a local Vec so the body either commits
+        // Build the new tables into their slots here so the body either commits
         // entirely or commits not at all.
-        let mut new_tables: Vec<(usize, [i32; 64])> = Vec::new();
+        let mut new_tables: [Option<[i32; 64]>; MAX_COMPONENTS] = [None; MAX_COMPONENTS];
         while cursor.remaining() > 0 {
             let qt_info = cursor.read_u8()?;
             // 0 = 8 bit otherwise 16 bit dqt
@@ -327,11 +339,13 @@ pub(crate) fn parse_dqt<T: ZByteReaderTrait>(img: &mut JpegDecoder<T>) -> Result
             };
 
             trace!("Assigning qt table {table_position} with precision {precision}");
-            new_tables.push((table_position, dct_table));
+            new_tables[table_position] = Some(dct_table);
         }
         // Commit phase.
-        for (table_position, dct_table) in new_tables {
-            img.qt_tables[table_position] = Some(Arc::new(dct_table));
+        for (slot, table) in img.qt_tables.iter_mut().zip(new_tables) {
+            if table.is_some() {
+                *slot = table;
+            }
         }
         Ok(())
     })
@@ -348,7 +362,7 @@ pub(crate) fn parse_start_of_frame<T: ZByteReaderTrait>(
     }
     with_marker_body(img, |img, mut cursor| {
         let dc_symbol_limit = if sof.is_lossless() { 16 } else { 15 };
-        for table in img.entropy_tables.dc_huffman.iter().flatten() {
+        for table in img.entropy_tables.huffman.dc_tables() {
             table.validate_dc_symbol_limit(dc_symbol_limit)?;
         }
 
@@ -539,7 +553,8 @@ pub(crate) fn parse_sos<T: ZByteReaderTrait>(
         // Validate inputs first; only mutate component table assignments at the
         // end so a malformed body cannot leave the decoder half-updated.
         let mut z_order = image.z_order;
-        let mut huff_assignments: Vec<(usize, u8)> = Vec::with_capacity(ns as usize);
+        // `ns` is at most `MAX_COMPONENTS` (checked above).
+        let mut huff_assignments = [(0_usize, 0_u8); MAX_COMPONENTS];
         let mut scan_subsampled = false;
         for i in 0..ns {
             let id = cursor.read_u8()?;
@@ -572,7 +587,7 @@ pub(crate) fn parse_sos<T: ZByteReaderTrait>(
                 )));
             }
 
-            huff_assignments.push((usize::from(j), y));
+            huff_assignments[usize::from(i)] = (usize::from(j), y);
             z_order[i as usize] = j as usize;
 
             let component = &image.components[usize::from(j)];
@@ -601,7 +616,7 @@ pub(crate) fn parse_sos<T: ZByteReaderTrait>(
         image.num_scans = ns;
         image.scan_subsampled = scan_subsampled;
         image.z_order = z_order;
-        for (j, y) in huff_assignments {
+        for &(j, y) in &huff_assignments[..usize::from(ns)] {
             let component = &mut image.components[j];
             component.dc_huff_table = usize::from((y >> 4) & 0xF);
             component.ac_huff_table = usize::from(y & 0xF);

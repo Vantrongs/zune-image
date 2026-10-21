@@ -70,12 +70,11 @@ fn memory_does_not_grow_with_the_height() {
     // A checkpoint holds one row of coefficients: 33 blocks of 64 `i16`.
     assert_eq!(checkpoint, 264 * 8 * 2);
     // That row in the reader and the checkpoint, the output band, the headers, with
-    // `std` the input buffer, and the headers' tables, which the state the decoder
-    // keeps to retry a scan shares rather than copies: two Huffman tables of under
-    // 4 KiB and a quantization table, and with `arith` the arithmetic coding
-    // statistics, about 2.4 KiB.
+    // `std` the input buffer, the token by which the state the decoder keeps to retry
+    // a scan holds the Huffman tables (which stay in the decoder), and with `arith`
+    // the arithmetic coding statistics, about 2.4 KiB.
     let input_buffer = if cfg!(feature = "std") { 8192 } else { 0 };
-    let header_tables = 2 * 4096 + if cfg!(feature = "arith") { 2560 } else { 0 };
+    let header_tables = 16 + if cfg!(feature = "arith") { 2560 } else { 0 };
     assert!(
         peak <= 40 * 264 + 2048 + input_buffer + header_tables,
         "peak {peak}"

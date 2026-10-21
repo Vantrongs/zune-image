@@ -188,8 +188,14 @@ impl Components {
     pub fn setup_upsample_scanline(&mut self) {
         fn init_if_size_changed(buffer: &mut Vec<i16>, len: usize, value: i16) {
             if buffer.len() != len {
-                buffer.clear();
-                buffer.resize(len, value);
+                if buffer.capacity() < len {
+                    // A new buffer rather than a grown one: nothing to copy, and
+                    // zeroes come from `calloc`.
+                    *buffer = vec![value; len];
+                } else {
+                    buffer.clear();
+                    buffer.resize(len, value);
+                }
             }
         }
 

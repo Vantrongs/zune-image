@@ -48,7 +48,6 @@
 //! Knock yourself out.
 use alloc::format;
 use alloc::string::ToString;
-use alloc::sync::Arc;
 use core::cmp::min;
 
 use zune_core::bytestream::{ZByteReaderTrait, ZReader};
@@ -56,7 +55,7 @@ use zune_core::log::warn;
 
 use crate::decoder::EntropyTables;
 use crate::errors::DecodeErrors;
-use crate::huffman::{HuffmanTable, HUFF_LOOKAHEAD};
+use crate::huffman::{HuffmanTable, InstalledTable, TableClass, HUFF_LOOKAHEAD};
 use crate::marker::Marker;
 use crate::mcu::DCT_BLOCK;
 use crate::misc::UN_ZIGZAG;
@@ -405,80 +404,28 @@ impl BitStreamHuffman {
 
 impl BitStream for BitStreamHuffman {
     type State = HuffmanBitstreamState;
-    // Shared with the scan's header snapshots: decoding only reads a Huffman table.
-    type DCEntropyTable = Arc<HuffmanTable>;
-    type ACEntropyTable = Arc<HuffmanTable>;
+    // Decoding only reads a Huffman table; `HuffmanTables` alone changes one.
+    type DCEntropyTable = InstalledTable;
+    type ACEntropyTable = InstalledTable;
 
     #[inline(always)]
     fn get_dc_table(
         tables: &mut EntropyTables, dc_pos: usize
     ) -> Result<&mut Self::DCEntropyTable, DecodeErrors> {
-        let dc_table = tables
-            .dc_huffman
-            .get_mut(dc_pos)
-            .ok_or_else(|| {
-                DecodeErrors::Format(format!("No huffman table for DC component: {dc_pos}"))
-            })?
-            .as_mut()
-            .ok_or_else(|| {
-                DecodeErrors::Format(format!(
-                    "DC Huffman table at index {dc_pos} not initialized"
-                ))
-            })?;
-
-        Ok(dc_table)
+        tables.huffman.get_mut(TableClass::Dc, dc_pos)
     }
 
     #[inline(always)]
     fn get_ac_table(
         tables: &mut EntropyTables, ac_pos: usize
     ) -> Result<&mut Self::ACEntropyTable, DecodeErrors> {
-        let ac_table = tables
-            .ac_huffman
-            .get_mut(ac_pos)
-            .ok_or_else(|| {
-                DecodeErrors::Format(format!("No huffman table for AC component: {ac_pos}"))
-            })?
-            .as_mut()
-            .ok_or_else(|| {
-                DecodeErrors::Format(format!(
-                    "AC Huffman table at index {ac_pos} not initialized"
-                ))
-            })?;
-
-        Ok(ac_table)
+        tables.huffman.get_mut(TableClass::Ac, ac_pos)
     }
     #[inline(always)]
     fn get_dc_ac_tables(
         tables: &mut EntropyTables, dc_pos: usize, ac_pos: usize
     ) -> Result<(&mut Self::DCEntropyTable, &mut Self::ACEntropyTable), DecodeErrors> {
-        let dc_table = tables
-            .dc_huffman
-            .get_mut(dc_pos)
-            .ok_or_else(|| {
-                DecodeErrors::Format(format!("No huffman table for DC component: {dc_pos}"))
-            })?
-            .as_mut()
-            .ok_or_else(|| {
-                DecodeErrors::Format(format!(
-                    "DC Huffman table at index {dc_pos} not initialized"
-                ))
-            })?;
-
-        let ac_table = tables
-            .ac_huffman
-            .get_mut(ac_pos)
-            .ok_or_else(|| {
-                DecodeErrors::Format(format!("No huffman table for AC component: {ac_pos}"))
-            })?
-            .as_mut()
-            .ok_or_else(|| {
-                DecodeErrors::Format(format!(
-                    "AC Huffman table at index {ac_pos} not initialized"
-                ))
-            })?;
-
-        Ok((dc_table, ac_table))
+        tables.huffman.get_pair_mut(dc_pos, ac_pos)
     }
 
     #[inline(always)]
@@ -753,8 +700,8 @@ impl BitStream for BitStreamHuffman {
     )]
     #[inline(never)]
     fn decode_mcu_block<T>(
-        &mut self, reader: &mut ZReader<T>, dc_table: &mut Arc<HuffmanTable>,
-        ac_table: &mut Arc<HuffmanTable>, qt_table: &[i32; DCT_BLOCK], block: &mut [i32; 64],
+        &mut self, reader: &mut ZReader<T>, dc_table: &mut InstalledTable,
+        ac_table: &mut InstalledTable, qt_table: &[i32; DCT_BLOCK], block: &mut [i32; 64],
         dc_prediction: &mut i32, _last_dc_diff: &mut i32
     ) -> Result<u16, DecodeErrors>
     where
@@ -823,8 +770,8 @@ impl BitStream for BitStreamHuffman {
     /// This updates DC prediction but we never dequantize and we never do any Zig-Zag translation
     /// either. Still returns the index of the last component read.
     fn discard_mcu_block<T>(
-        &mut self, reader: &mut ZReader<T>, dc_table: &mut Arc<HuffmanTable>,
-        ac_table: &mut Arc<HuffmanTable>, _last_dc_diff: &mut i32
+        &mut self, reader: &mut ZReader<T>, dc_table: &mut InstalledTable,
+        ac_table: &mut InstalledTable, _last_dc_diff: &mut i32
     ) -> Result<u16, DecodeErrors>
     where
         T: ZByteReaderTrait
@@ -882,7 +829,7 @@ impl BitStream for BitStreamHuffman {
     #[allow(clippy::cast_possible_truncation)]
     #[inline]
     fn decode_prog_dc_first<T>(
-        &mut self, reader: &mut ZReader<T>, dc_table: &mut Arc<HuffmanTable>, block: &mut i16,
+        &mut self, reader: &mut ZReader<T>, dc_table: &mut InstalledTable, block: &mut i16,
         dc_prediction: &mut i32, _last_dc_diff: &mut i32
     ) -> Result<(), DecodeErrors>
     where
@@ -919,7 +866,7 @@ impl BitStream for BitStreamHuffman {
     }
 
     fn decode_mcu_ac_first<T>(
-        &mut self, reader: &mut ZReader<T>, ac_table: &mut Arc<HuffmanTable>,
+        &mut self, reader: &mut ZReader<T>, ac_table: &mut InstalledTable,
         block: &mut [i16; 64]
     ) -> Result<bool, DecodeErrors>
     where
@@ -979,7 +926,7 @@ impl BitStream for BitStreamHuffman {
     }
     #[allow(clippy::too_many_lines, clippy::op_ref)]
     fn decode_mcu_ac_refine<T>(
-        &mut self, reader: &mut ZReader<T>, table: &mut Arc<HuffmanTable>, block: &mut [i16; 64]
+        &mut self, reader: &mut ZReader<T>, table: &mut InstalledTable, block: &mut [i16; 64]
     ) -> Result<bool, DecodeErrors>
     where
         T: ZByteReaderTrait

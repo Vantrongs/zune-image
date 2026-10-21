@@ -1414,7 +1414,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         if e.is_recoverable_eof() || matches!(e, DecodeErrors::Cancelled) {
                             if let Some((append_snapshot, header_snapshot)) = &inter_scan_snapshot {
                                 append_snapshot.rollback(self);
-                                self.restore_scan_header_state(header_snapshot);
+                                self.restore_scan_header_state(header_snapshot)?;
                             }
                         }
                         return Err(e);
@@ -1482,7 +1482,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         }
                         if let Some((append_snapshot, header_snapshot)) = &inter_scan_snapshot {
                             append_snapshot.rollback(self);
-                            self.restore_scan_header_state(header_snapshot);
+                            self.restore_scan_header_state(header_snapshot)?;
                         }
                         return Err(DecodeErrors::Format(format!(
                             "Unexpected marker {other:?} after completed scan"
