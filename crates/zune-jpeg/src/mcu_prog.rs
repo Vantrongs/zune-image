@@ -586,7 +586,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 self.parse_dc_refine_interleaved(stream, buffer, progress)?;
             }
         }
-        Ok(())
+        self.check_read_fill(stream)
     }
 
     #[inline(always)]

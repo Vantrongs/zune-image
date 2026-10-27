@@ -1245,6 +1245,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     fn check_stream_marker_after_mcu_width<B: BitStream>(
         &mut self, stream: &mut B, is_last_row: bool, mcu_row: usize,
     ) -> Result<McuContinuation, DecodeErrors> {
+        self.check_read_fill(stream)?;
         // After all interleaved components, that's an MCU
         // handle stream markers
         //
@@ -1510,11 +1511,24 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         }
     }
 
+    /// Strict mode rejects entropy-coded data that ended at a marker, such as an early
+    /// EOI, before its scan or restart interval was decoded. Lenient decoding reads
+    /// the rest as zero bits, as libjpeg-turbo does.
+    pub(crate) fn check_read_fill<B: BitStream>(&self, stream: &B) -> Result<(), DecodeErrors> {
+        if stream.read_fill() && self.options.strict_mode() {
+            return Err(DecodeErrors::FormatStatic(
+                "Entropy-coded data ended at a marker before the scan was complete",
+            ));
+        }
+        Ok(())
+    }
+
     // handle RST markers.
     // No-op if not using restarts
     // this routine is shared with mcu_prog
     #[cold]
     pub(crate) fn handle_rst<B: BitStream>(&mut self, stream: &mut B) -> Result<(), DecodeErrors> {
+        self.check_read_fill(stream)?;
         self.todo = self.restart_interval;
 
         if let Some(marker) = stream.marker() {

@@ -120,7 +120,8 @@ pub(crate) struct HuffmanBitstreamState {
     pub(crate) marker:         Option<Marker>,
     pub(crate) overread_by:    usize,
     pub(crate) seen_eoi:       bool,
-    pub(crate) eob_run:        i32
+    pub(crate) eob_run:        i32,
+    pub(crate) fill_bits:      usize
 }
 
 /// Type-erased bitstream state snapshot stored in `ScanCheckpoint`.
@@ -228,6 +229,14 @@ pub(crate) trait BitStream {
     /// Tell us the bits left the two buffer
     fn bits_left(&self) -> u8;
 
+    /// True once the decoder has read bits past a marker that ended the entropy-coded
+    /// data early: the zero bits the stream fills in after a marker. Huffman data ends
+    /// at its marker, so this means the scan or restart interval was cut short. The
+    /// arithmetic decoder reads zero bytes after a marker by design.
+    fn read_fill(&self) -> bool {
+        false
+    }
+
     /// True when a latched marker plus `bits_left() == 0` means the entropy-coded
     /// data is used up. Huffman data ends at the marker; the arithmetic decoder
     /// keeps reading zero bytes after a marker until the scan is complete, and its
@@ -279,6 +288,8 @@ pub(crate) struct BitStreamHuffman {
     seen_eoi:            bool,
     /// Strict mode, see [`BitStream::set_strict`].
     strict:              bool,
+    /// Zero bits appended after a marker, see [`BitStream::read_fill`].
+    fill_bits:           usize,
 }
 
 impl BitStreamHuffman {
@@ -449,6 +460,7 @@ impl BitStream for BitStreamHuffman {
             overread_by:         0,
             seen_eoi:            false,
             strict:              false,
+            fill_bits:           0,
         }
     }
 
@@ -469,6 +481,7 @@ impl BitStream for BitStreamHuffman {
             overread_by:         0,
             seen_eoi:            false,
             strict:              false,
+            fill_bits:           0,
         }
     }
 
@@ -502,6 +515,12 @@ impl BitStream for BitStreamHuffman {
         true
     }
 
+    /// The filled bits follow every real one in the buffer, so fewer bits left than
+    /// were filled means some were read.
+    fn read_fill(&self) -> bool {
+        usize::from(self.bits_left) < self.fill_bits
+    }
+
     #[inline(always)]
     fn supports_mcu_checkpoint() -> bool {
         true
@@ -516,7 +535,8 @@ impl BitStream for BitStreamHuffman {
             marker:         self.marker,
             overread_by:    self.overread_by,
             seen_eoi:       self.seen_eoi,
-            eob_run:        self.eob_run
+            eob_run:        self.eob_run,
+            fill_bits:      self.fill_bits
         }
     }
 
@@ -529,6 +549,7 @@ impl BitStream for BitStreamHuffman {
         self.overread_by = state.overread_by;
         self.seen_eoi = state.seen_eoi;
         self.eob_run = state.eob_run;
+        self.fill_bits = state.fill_bits;
     }
 
     #[inline(always)]
@@ -613,6 +634,7 @@ impl BitStream for BitStreamHuffman {
                                 // removes some panics
                                 self.buffer <<= 8;
                                 self.bits_left += 8;
+                                self.fill_bits += 8;
                                 self.aligned_buffer = self.buffer << (64 - self.bits_left);
                             }
 
@@ -632,6 +654,7 @@ impl BitStream for BitStreamHuffman {
                 // fill with zeroes
                 self.buffer <<= 32;
                 self.bits_left += 32;
+                self.fill_bits = self.fill_bits.saturating_add(32);
                 self.aligned_buffer = self.buffer << (64 - self.bits_left);
                 return Ok(true);
             }
@@ -1081,6 +1104,7 @@ impl BitStream for BitStreamHuffman {
         self.buffer = 0;
         self.aligned_buffer = 0;
         self.eob_run = 0;
+        self.fill_bits = 0;
     }
 }
 

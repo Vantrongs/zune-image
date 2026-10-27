@@ -76,7 +76,7 @@ fn memory_does_not_grow_with_the_height() {
     let input_buffer = if cfg!(feature = "std") { 8192 } else { 0 };
     let header_tables = 16 + if cfg!(feature = "arith") { 2560 } else { 0 };
     assert!(
-        peak <= 40 * 264 + 2048 + input_buffer + header_tables,
+        peak <= 40 * 264 + 2056 + input_buffer + header_tables,
         "peak {peak}"
     );
 }

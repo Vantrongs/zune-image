@@ -10,7 +10,7 @@ use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
 use zune_jpeg::errors::DecodeErrors;
-use zune_jpeg::JpegDecoder;
+use zune_jpeg::{JpegDecoder, RawImcuRowStatus};
 
 #[test]
 fn eof() {
@@ -301,6 +301,115 @@ fn ac_run_past_end_of_block() {
                 Err(DecodeErrors::FormatStatic(m)) if m.contains("past the end") => {}
                 Err(e) => failures.push(format!("{case}: strict: {e:?}")),
                 Ok(_) => failures.push(format!("{case}: strict: accepted"))
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Each scan's entropy-coded data, from after its header to the marker that ends it;
+/// restart markers belong to the data.
+fn scan_data(data: &[u8]) -> Vec<core::ops::Range<usize>> {
+    let (mut scans, mut at) = (vec![], 2);
+    while at + 4 <= data.len() && data[at] == 0xff {
+        let length = usize::from(u16::from_be_bytes([data[at + 2], data[at + 3]]));
+        match data[at + 1] {
+            0xd9 => break,
+            0xda => {
+                let start = at + 2 + length;
+                at = start;
+                let ends_data = |m: u8| m != 0 && !(0xd0..=0xd7).contains(&m);
+                while !(data[at] == 0xff && ends_data(data[at + 1])) {
+                    at += 1;
+                }
+                scans.push(start..at);
+            }
+            _ => at += 2 + length
+        }
+    }
+    scans
+}
+
+/// Whether every raw iMCU row decodes, as a caller that keeps no pixels checks a file.
+fn raw_rows_complete(data: &[u8], strict: bool) -> bool {
+    let options = DecoderOptions::default().set_strict_mode(strict);
+    let mut decoder = JpegDecoder::new_with_options(ZCursor::new(data), options);
+    decoder.decode_headers().unwrap();
+    let mut raw = decoder.raw_output();
+    let count = raw.num_components().unwrap();
+    let layout = raw.layout().unwrap();
+    let strides: Vec<usize> = layout[..count].iter().map(|plane| plane.stride).collect();
+    let mut rows: Vec<Vec<u8>> = layout[..count]
+        .iter()
+        .map(|plane| vec![0; plane.stride * plane.vertical_sampling_factor * 8])
+        .collect();
+    loop {
+        let mut planes: Vec<&mut [u8]> = rows.iter_mut().map(Vec::as_mut_slice).collect();
+        match raw.decode_next_imcu_row(&mut planes, &strides) {
+            Ok(RawImcuRowStatus::RowReady { .. }) => {}
+            Ok(RawImcuRowStatus::Complete) => return true,
+            Ok(_) | Err(_) => return false
+        }
+    }
+}
+
+#[test]
+fn scan_cut_short_by_eoi() {
+    // A scan cut and closed with EOI decodes leniently, the rest of it read as zero
+    // bits as libjpeg-turbo does; strict decoding rejects it, in baseline and
+    // progressive scans (successive approximation included), with and without restart
+    // intervals, through `decode` and the raw row API.
+    let pixels: Vec<u8> = (0..64 * 48 * 3).map(|i: usize| (i * 7919 % 251) as u8).collect();
+    let encoded = |progressive: bool, restart_interval: u16| {
+        let mut data = vec![];
+        let mut encoder = jpeg_encoder::Encoder::new(&mut data, 90);
+        encoder.set_progressive(progressive);
+        if restart_interval > 0 {
+            encoder.set_restart_interval(restart_interval);
+        }
+        encoder.encode(&pixels, 64, 48, jpeg_encoder::ColorType::Rgb).unwrap();
+        data
+    };
+    let images = [
+        ("baseline", encoded(false, 0)),
+        ("baseline, restart interval 1", encoded(false, 1)),
+        ("progressive", encoded(true, 0)),
+        ("progressive, restart interval 2", encoded(true, 2)),
+        (
+            "progressive_restart_420.jpg",
+            include_bytes!("../../../test-images/jpeg/progressive_restart_420.jpg").to_vec()
+        )
+    ];
+    let decode = |data: &[u8], strict: bool| {
+        let options = DecoderOptions::default().set_strict_mode(strict);
+        JpegDecoder::new_with_options(ZCursor::new(data), options).decode()
+    };
+    let mut failures = vec![];
+    for (name, data) in &images {
+        if let Err(e) = decode(data, true) {
+            failures.push(format!("{name}: whole: strict: {e:?}"));
+        }
+        if !raw_rows_complete(data, true) {
+            failures.push(format!("{name}: whole: strict raw rows failed"));
+        }
+        for (k, scan) in scan_data(data).into_iter().enumerate() {
+            let middle = scan.start + scan.len() / 2;
+            for mut cut in [scan.start + 1, middle, scan.end - 1] {
+                while data[cut - 1] == 0xff {
+                    cut -= 1;
+                }
+                let case = format!("{name}: scan {k} cut at {cut}");
+                let mut broken = data[..cut].to_vec();
+                broken.extend([0xff, 0xd9]);
+                if let Err(e) = decode(&broken, false) {
+                    failures.push(format!("{case}: lenient: {e:?}"));
+                }
+                if decode(&broken, true).is_ok() {
+                    failures.push(format!("{case}: strict: accepted"));
+                }
+                if raw_rows_complete(&broken, true) {
+                    failures.push(format!("{case}: strict raw rows: accepted"));
+                }
             }
         }
     }
