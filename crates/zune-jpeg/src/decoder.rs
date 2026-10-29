@@ -584,7 +584,10 @@ struct RawPullState {
     arith_stats:              Option<ArithStats>,
     layout:                   Option<[PlaneInfo; MAX_COMPONENTS]>,
     rows_per_stripe:          [usize; MAX_COMPONENTS],
-    buffered_source_complete: bool
+    buffered_source_complete: bool,
+    /// Whether buffered decoding records scan checkpoints
+    /// ([`RawDecodeSession::set_scan_checkpoints`]).
+    scan_checkpoints:         bool
 }
 
 struct RawPullTargets {
@@ -603,7 +606,8 @@ impl Default for RawPullState {
             arith_stats:              None,
             layout:                   None,
             rows_per_stripe:          [0; MAX_COMPONENTS],
-            buffered_source_complete: false
+            buffered_source_complete: false,
+            scan_checkpoints:         true
         }
     }
 }
@@ -677,6 +681,39 @@ where
             .raw_pull_state
             .layout
             .or_else(|| self.decoder.raw_planar_layout())
+    }
+
+    /// Whether a retry after [`RawImcuRowStatus::NeedMoreInput`] in a
+    /// progressive or multi-SOS image resumes from a checkpoint (`true`, the
+    /// default) or decodes again from the first scan.
+    ///
+    /// Resuming a progressive image at a scan boundary needs the coefficients
+    /// as they were before the current scan, so each scan decodes into a copy
+    /// of the components it updates: up to twice the coefficient memory. A
+    /// caller whose input is complete never retries and can turn this off to
+    /// hold one copy. Retrying stays correct either way. Interleaved baseline
+    /// images keep their row checkpoints, which hold no coefficients.
+    ///
+    /// Choose it before the first pull: the setting is fixed for the decode
+    /// sequence that pull begins. A session created after the sequence
+    /// completes begins a new one, with the default.
+    ///
+    /// # Errors
+    /// Returns [`DecodeErrors::FormatStatic`] when asked for a different
+    /// setting after the sequence has begun, because a checkpoint saved under
+    /// one setting cannot be resumed under the other.
+    pub fn set_scan_checkpoints(&mut self, enabled: bool) -> Result<(), DecodeErrors> {
+        let state = &mut self.decoder.raw_pull_state;
+        if state.scan_checkpoints == enabled {
+            return Ok(());
+        }
+        if state.owner != RawPullOwner::None {
+            return Err(DecodeErrors::FormatStatic(
+                "cannot change scan checkpoints once a raw decode sequence has begun"
+            ));
+        }
+        state.scan_checkpoints = enabled;
+        Ok(())
     }
 
     /// Decode the next sequential raw iMCU row into caller-provided planes.
@@ -925,7 +962,7 @@ where
         &mut self, output: &mut McuDecodeOutput<'_, '_>,
         layout: &[PlaneInfo; MAX_COMPONENTS], n: usize
     ) -> Result<(), DecodeErrors> {
-        self.prepare_pull_scan()?;
+        self.decoder.prepare_for_scan_decode()?;
         let buffered = self.decoder.is_progressive
             || usize::from(self.decoder.num_scans) != self.decoder.components.len();
         self.decoder.raw_pull_state.phase = if buffered {
@@ -933,6 +970,7 @@ where
         } else {
             RawPullPhase::StreamingBaseline
         };
+        self.enable_pull_checkpoints();
         if buffered {
             self.decode_buffered_source_and_render(output, layout, n)
         } else {
@@ -942,8 +980,14 @@ where
 
     fn prepare_pull_scan(&mut self) -> Result<(), DecodeErrors> {
         self.decoder.prepare_for_scan_decode()?;
-        self.decoder.mcu_checkpoints_enabled = true;
+        self.enable_pull_checkpoints();
         Ok(())
+    }
+
+    fn enable_pull_checkpoints(&mut self) {
+        let state = &self.decoder.raw_pull_state;
+        self.decoder.mcu_checkpoints_enabled =
+            state.scan_checkpoints || state.phase == RawPullPhase::StreamingBaseline;
     }
 
     fn decode_buffered_source_and_render(

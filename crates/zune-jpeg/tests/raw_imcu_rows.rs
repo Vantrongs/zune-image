@@ -342,6 +342,12 @@ fn assert_exact_sized_pull_matches_whole(bytes: &[u8]) {
 fn assert_incremental_pull_is_atomic(
     name: &str, data: &[u8], step: usize, minimum_suspensions: usize,
 ) {
+    assert_pull_is_atomic(name, data, step, minimum_suspensions, true);
+}
+
+fn assert_pull_is_atomic(
+    name: &str, data: &[u8], step: usize, minimum_suspensions: usize, scan_checkpoints: bool,
+) {
     const GUARD: usize = 17;
     const SENTINEL: u8 = 0xCD;
 
@@ -366,6 +372,7 @@ fn assert_incremental_pull_is_atomic(
     }
 
     let mut raw = decoder.raw_output();
+    raw.set_scan_checkpoints(scan_checkpoints).unwrap();
     let layout = raw.layout().unwrap();
     let count = raw.num_components().unwrap();
     let strides: Vec<usize> = layout[..count]
@@ -474,6 +481,113 @@ fn suspension_cut_points_are_atomic_and_retry_exactly() {
         1,
         10,
     );
+}
+
+#[test]
+fn without_scan_checkpoints_a_retry_decodes_again_from_the_first_scan() {
+    for (name, data) in [
+        (
+            "baseline",
+            &include_bytes!("../../../test-images/jpeg/app14/baseline_rgb_interleaved.jpg")[..],
+        ),
+        (
+            "progressive_restart",
+            &include_bytes!("../../../test-images/jpeg/progressive_restart_420.jpg")[..],
+        ),
+        (
+            "multi_sos",
+            &include_bytes!("../../../test-images/jpeg/non_interleaved_420_64x64.jpg")[..],
+        ),
+        #[cfg(feature = "arith")]
+        (
+            "arithmetic_progressive",
+            &include_bytes!("../../../test-images/jpeg/arith/prog.jpg")[..],
+        ),
+    ] {
+        assert_pull_is_atomic(name, data, 7, 10, false);
+    }
+}
+
+/// Suspends a pull of `data` once at each cut point with `initial` scan
+/// checkpoints, asks for the other setting, exposes the rest of the input and
+/// checks the finished planes. Returns how many cut points suspended.
+fn switch_scan_checkpoints_after_suspension(data: &[u8], initial: bool, step: usize) -> usize {
+    let (whole, layout, count) = decode_whole(data);
+    let strides: Vec<usize> = layout[..count].iter().map(|plane| plane.width).collect();
+    let mut suspended = 0;
+    for cut in (step..data.len()).step_by(step) {
+        let limit = Rc::new(Cell::new(cut));
+        let mut decoder = JpegDecoder::new(GrowableCursor::new(data, Rc::clone(&limit)));
+        if decoder.decode_headers().is_err() {
+            continue;
+        }
+        let mut raw = decoder.raw_output();
+        raw.set_scan_checkpoints(initial).unwrap();
+        let mut actual: Vec<Vec<u8>> = (0..count)
+            .map(|index| vec![0; layout[index].width * layout[index].height])
+            .collect();
+        let mut component_rows = [0usize; 4];
+        let mut switched = false;
+        loop {
+            let mut stripes: Vec<Vec<u8>> = (0..count)
+                .map(|index| vec![0; strides[index] * layout[index].vertical_sampling_factor * 8])
+                .collect();
+            let mut refs: Vec<&mut [u8]> = stripes.iter_mut().map(Vec::as_mut_slice).collect();
+            match raw.decode_next_imcu_row(&mut refs, &strides) {
+                Ok(RawImcuRowStatus::RowReady { rows_written }) => {
+                    for index in 0..count {
+                        let start = component_rows[index] * strides[index];
+                        let length = rows_written[index] * strides[index];
+                        actual[index][start..start + length]
+                            .copy_from_slice(&stripes[index][..length]);
+                        component_rows[index] += rows_written[index];
+                    }
+                }
+                Ok(RawImcuRowStatus::NeedMoreInput) => {
+                    assert!(!switched, "cut {cut}: suspended with the whole input");
+                    assert!(
+                        raw.set_scan_checkpoints(!initial).is_err(),
+                        "cut {cut}: the setting changed after the pull began"
+                    );
+                    // The sequence outlives its session.
+                    drop(raw);
+                    raw = decoder.raw_output();
+                    assert!(
+                        raw.set_scan_checkpoints(!initial).is_err(),
+                        "cut {cut}: a new session changed the setting mid-sequence"
+                    );
+                    raw.set_scan_checkpoints(initial).unwrap();
+                    switched = true;
+                    suspended += 1;
+                    limit.set(data.len());
+                }
+                Ok(RawImcuRowStatus::Complete) => break,
+                Ok(_) => unreachable!("unknown raw iMCU-row status"),
+                Err(error) => panic!("cut {cut}: {error:?}"),
+            }
+        }
+        for index in 0..count {
+            assert_eq!(component_rows[index], layout[index].height, "cut {cut}");
+            for row in 0..layout[index].height {
+                let width = layout[index].width;
+                assert_eq!(
+                    &actual[index][row * width..(row + 1) * width],
+                    &whole[index][row * layout[index].stride..row * layout[index].stride + width],
+                    "cut {cut}: component {index}, row {row}"
+                );
+            }
+        }
+    }
+    suspended
+}
+
+#[test]
+fn scan_checkpoints_cannot_change_once_a_pull_has_begun() {
+    let data = include_bytes!("../../../test-images/jpeg/progressive_restart_420.jpg");
+    for initial in [true, false] {
+        let suspended = switch_scan_checkpoints_after_suspension(data, initial, 32);
+        assert!(suspended > 100, "only {suspended} cut points suspended");
+    }
 }
 
 #[test]
