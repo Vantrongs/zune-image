@@ -71,7 +71,7 @@ fn pull_peak(jpeg: &[u8], scan_checkpoints: bool) -> (usize, Vec<Vec<u8>>) {
     let mut decoder = JpegDecoder::new(ZCursor::new(jpeg));
     decoder.decode_headers().unwrap();
     let mut raw = decoder.raw_output();
-    raw.set_scan_checkpoints(scan_checkpoints);
+    raw.set_scan_checkpoints(scan_checkpoints).unwrap();
     let layout = raw.layout().unwrap();
     let count = raw.num_components().unwrap();
     let strides: Vec<usize> = layout[..count].iter().map(|plane| plane.width).collect();

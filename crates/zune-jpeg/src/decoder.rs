@@ -693,8 +693,27 @@ where
     /// caller whose input is complete never retries and can turn this off to
     /// hold one copy. Retrying stays correct either way. Interleaved baseline
     /// images keep their row checkpoints, which hold no coefficients.
-    pub fn set_scan_checkpoints(&mut self, enabled: bool) {
-        self.decoder.raw_pull_state.scan_checkpoints = enabled;
+    ///
+    /// Choose it before the first pull: the setting is fixed for the decode
+    /// sequence that pull begins. A session created after the sequence
+    /// completes begins a new one, with the default.
+    ///
+    /// # Errors
+    /// Returns [`DecodeErrors::FormatStatic`] when asked for a different
+    /// setting after the sequence has begun, because a checkpoint saved under
+    /// one setting cannot be resumed under the other.
+    pub fn set_scan_checkpoints(&mut self, enabled: bool) -> Result<(), DecodeErrors> {
+        let state = &mut self.decoder.raw_pull_state;
+        if state.scan_checkpoints == enabled {
+            return Ok(());
+        }
+        if state.owner != RawPullOwner::None {
+            return Err(DecodeErrors::FormatStatic(
+                "cannot change scan checkpoints once a raw decode sequence has begun"
+            ));
+        }
+        state.scan_checkpoints = enabled;
+        Ok(())
     }
 
     /// Decode the next sequential raw iMCU row into caller-provided planes.
