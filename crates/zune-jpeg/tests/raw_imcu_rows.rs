@@ -342,6 +342,12 @@ fn assert_exact_sized_pull_matches_whole(bytes: &[u8]) {
 fn assert_incremental_pull_is_atomic(
     name: &str, data: &[u8], step: usize, minimum_suspensions: usize,
 ) {
+    assert_pull_is_atomic(name, data, step, minimum_suspensions, true);
+}
+
+fn assert_pull_is_atomic(
+    name: &str, data: &[u8], step: usize, minimum_suspensions: usize, scan_checkpoints: bool,
+) {
     const GUARD: usize = 17;
     const SENTINEL: u8 = 0xCD;
 
@@ -366,6 +372,7 @@ fn assert_incremental_pull_is_atomic(
     }
 
     let mut raw = decoder.raw_output();
+    raw.set_scan_checkpoints(scan_checkpoints);
     let layout = raw.layout().unwrap();
     let count = raw.num_components().unwrap();
     let strides: Vec<usize> = layout[..count]
@@ -474,6 +481,31 @@ fn suspension_cut_points_are_atomic_and_retry_exactly() {
         1,
         10,
     );
+}
+
+#[test]
+fn without_scan_checkpoints_a_retry_decodes_again_from_the_first_scan() {
+    for (name, data) in [
+        (
+            "baseline",
+            &include_bytes!("../../../test-images/jpeg/app14/baseline_rgb_interleaved.jpg")[..],
+        ),
+        (
+            "progressive_restart",
+            &include_bytes!("../../../test-images/jpeg/progressive_restart_420.jpg")[..],
+        ),
+        (
+            "multi_sos",
+            &include_bytes!("../../../test-images/jpeg/non_interleaved_420_64x64.jpg")[..],
+        ),
+        #[cfg(feature = "arith")]
+        (
+            "arithmetic_progressive",
+            &include_bytes!("../../../test-images/jpeg/arith/prog.jpg")[..],
+        ),
+    ] {
+        assert_pull_is_atomic(name, data, 7, 10, false);
+    }
 }
 
 #[test]
